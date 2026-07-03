@@ -1,0 +1,525 @@
+#!/usr/bin/env bash
+# tests/fm-backend-zellij.test.sh - fake-zellij-CLI unit tests for the zellij
+# session-provider adapter (bin/backends/zellij.sh), P3 of
+# data/fm-backend-design-d7 (report.md "Zellij Backend"). Mirrors
+# tests/fm-backend-herdr.test.sh's fakebin/command-log convention: a small,
+# LOG-based, canned-response fake `zellij` + real `jq` (jq is a real required
+# tool for this backend, not faked). The real-binary smoke test lives in
+# tests/fm-backend-zellij-smoke.test.sh, gated on the zellij binary actually
+# being installed.
+set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the zellij adapter)"; exit 0; }
+
+TMP_ROOT=$(fm_test_tmproot fm-backend-zellij-tests)
+
+# make_zellij_fakebin: a `zellij` stub that logs every invocation (one line,
+# unit-separated args, to $FM_ZELLIJ_LOG) and returns the canned response for
+# that call read from $FM_ZELLIJ_RESPONSES/<n>.out, consumed IN ORDER (call 1
+# reads 1.out, call 2 reads 2.out, ...), mirroring
+# tests/fm-backend-herdr.test.sh's make_herdr_fakebin. A missing response file
+# means "succeed with empty stdout" (paste/send-keys/close-* are silent on
+# success on the real CLI). `--version` and `list-sessions` are handled
+# specially (not call-counted) since fm_backend_zellij_session_exists calls
+# list-sessions on every op as a passive liveness probe and must not consume
+# the ordered response queue - its canned membership is controlled by
+# FM_ZELLIJ_SESSION_LIST instead.
+make_zellij_fakebin() {  # <dir> -> echoes fakebin dir
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+LOG="${FM_ZELLIJ_LOG:?}"
+RESP="${FM_ZELLIJ_RESPONSES:?}"
+COUNT_FILE="$RESP/.count"
+{
+  printf 'ZELLIJ_SESSION_NAME=%s' "${ZELLIJ_SESSION_NAME:-}"
+  for a in "$@"; do printf '\x1f%s' "$a"; done
+  printf '\n'
+} >> "$LOG"
+
+if [ "${1:-}" = --version ]; then
+  printf 'zellij %s\n' "${FM_ZELLIJ_FAKE_VERSION:-0.44.0}"
+  exit 0
+fi
+if [ "${1:-}" = list-sessions ]; then
+  printf '%s\n' "${FM_ZELLIJ_SESSION_LIST:-}"
+  exit 0
+fi
+if [ "${1:-}" = attach ]; then
+  exit "${FM_ZELLIJ_ATTACH_EXIT:-0}"
+fi
+
+next=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+n=$next
+echo "$n" > "$COUNT_FILE"
+if [ -f "$RESP/$n.exit" ]; then
+  exit "$(cat "$RESP/$n.exit")"
+fi
+[ -f "$RESP/$n.out" ] && cat "$RESP/$n.out"
+exit 0
+SH
+  chmod +x "$fb/zellij"
+  printf '%s\n' "$fb"
+}
+
+# --- version_check / tool_check ----------------------------------------------
+
+test_version_check_accepts_current_version() {
+  local dir fb status
+  dir="$TMP_ROOT/version-ok"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_FAKE_VERSION=0.44.0 \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_version_check' "$ROOT"
+  status=$?
+  expect_code 0 "$status" "version_check should accept 0.44.0 (the verified minimum)"
+  pass "fm_backend_zellij_version_check: accepts the verified minimum (0.44.0)"
+}
+
+test_version_check_accepts_newer_version() {
+  local dir fb status
+  dir="$TMP_ROOT/version-newer"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_FAKE_VERSION=0.45.2 \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_version_check' "$ROOT"
+  status=$?
+  expect_code 0 "$status" "version_check should accept a newer minor (0.45.2)"
+  pass "fm_backend_zellij_version_check: accepts a newer version (0.45.2)"
+}
+
+test_version_check_refuses_old_version() {
+  local dir fb out status
+  dir="$TMP_ROOT/version-old"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_FAKE_VERSION=0.38.1 \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_version_check' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "version_check should refuse 0.38.1 (below the 0.44 minimum)"
+  assert_contains "$out" "0.38.1" "version_check error did not name the rejected version"
+  pass "fm_backend_zellij_version_check: refuses an old version loudly"
+}
+
+test_version_check_refuses_missing_zellij() {
+  local dir out status
+  dir="$TMP_ROOT/version-missing"; mkdir -p "$dir/empty-fakebin"
+  out=$( PATH="$dir/empty-fakebin:/usr/bin:/bin" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_version_check' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "version_check should refuse when zellij is not installed"
+  assert_contains "$out" "not installed" "version_check did not report zellij as missing"
+  pass "fm_backend_zellij_version_check: refuses loudly when zellij is not installed"
+}
+
+# --- session name resolution --------------------------------------------------
+
+test_session_defaults_to_firstmate() {
+  local out
+  out=$( bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_session' "$ROOT" )
+  [ "$out" = firstmate ] || fail "default session should be 'firstmate', got '$out'"
+  pass "fm_backend_zellij_session: defaults to 'firstmate' when FM_ZELLIJ_SESSION is unset"
+}
+
+test_session_honors_override() {
+  local out
+  out=$( FM_ZELLIJ_SESSION=fm-test-iso bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_session' "$ROOT" )
+  [ "$out" = fm-test-iso ] || fail "FM_ZELLIJ_SESSION override was not honored, got '$out'"
+  pass "fm_backend_zellij_session: honors the FM_ZELLIJ_SESSION test-isolation override"
+}
+
+# --- target parsing, key normalization ---------------------------------------
+
+test_parse_target() {
+  ( . "$ROOT/bin/backends/zellij.sh"
+    fm_backend_zellij_parse_target "firstmate:5" || exit 1
+    [ "$FM_BACKEND_ZELLIJ_SESSION" = firstmate ] || { echo "session mismatch: $FM_BACKEND_ZELLIJ_SESSION" >&2; exit 1; }
+    [ "$FM_BACKEND_ZELLIJ_PANE" = "5" ] || { echo "pane mismatch: $FM_BACKEND_ZELLIJ_PANE" >&2; exit 1; }
+  ) || fail "fm_backend_zellij_parse_target did not split session:pane correctly"
+  pass "fm_backend_zellij_parse_target: splits '<session>:<pane_id>' on the first colon"
+}
+
+test_normalize_key() {
+  ( . "$ROOT/bin/backends/zellij.sh"
+    [ "$(fm_backend_zellij_normalize_key Enter)" = Enter ] || { echo "Enter failed" >&2; exit 1; }
+    [ "$(fm_backend_zellij_normalize_key Escape)" = Esc ] || { echo "Escape failed" >&2; exit 1; }
+    [ "$(fm_backend_zellij_normalize_key Esc)" = Esc ] || { echo "Esc failed" >&2; exit 1; }
+    [ "$(fm_backend_zellij_normalize_key C-c)" = "Ctrl c" ] || { echo "C-c failed" >&2; exit 1; }
+    [ "$(fm_backend_zellij_normalize_key ctrl+c)" = "Ctrl c" ] || { echo "ctrl+c failed" >&2; exit 1; }
+  ) || fail "fm_backend_zellij_normalize_key did not map firstmate's key vocabulary to zellij's verified names"
+  pass "fm_backend_zellij_normalize_key: Enter/Escape/C-c map to zellij's verified Enter/Esc/'Ctrl c'"
+}
+
+# --- session_exists / server_ensure -------------------------------------------
+
+test_session_exists_true_when_listed() {
+  local dir fb out
+  dir="$TMP_ROOT/exists-true"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=$'firstmate\nother-session' \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_session_exists firstmate' "$ROOT"
+  expect_code 0 $? "session_exists should report true when the session is in the list"
+  pass "fm_backend_zellij_session_exists: true when the session name is listed"
+}
+
+test_session_exists_false_when_absent() {
+  local dir fb
+  dir="$TMP_ROOT/exists-false"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=$'other-session' \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_session_exists firstmate' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "session_exists should report false when the session is absent"
+  pass "fm_backend_zellij_session_exists: false when the session name is not listed"
+}
+
+test_server_ensure_skips_attach_when_already_exists() {
+  local dir fb
+  dir="$TMP_ROOT/server-reuse"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_server_ensure firstmate' "$ROOT"
+  expect_code 0 $? "server_ensure should succeed immediately when the session already exists"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''attach' "server_ensure should not call attach when the session already exists"
+  pass "fm_backend_zellij_server_ensure: reuses an existing session without calling attach"
+}
+
+# --- dispatch wiring (fm-backend.sh) ------------------------------------------
+
+test_dispatch_routes_zellij_backend() {
+  fm_backend_validate zellij 2>/dev/null || fail "fm_backend_validate should accept zellij (P3 adds it to FM_BACKEND_KNOWN)"
+  pass "fm_backend_validate: zellij is a known backend (P3)"
+}
+
+test_dispatch_busy_state_unknown_for_zellij() {
+  # shellcheck source=bin/fm-backend.sh
+  . "$ROOT/bin/fm-backend.sh"
+  [ "$(fm_backend_busy_state zellij 'firstmate:5')" = unknown ] \
+    || fail "fm_backend_busy_state should report unknown for zellij (no native agent-state primitive; D5: watcher falls back to regex, same as tmux)"
+  pass "fm_backend_busy_state: zellij (no native primitive) always reports unknown, same as tmux"
+}
+
+# --- create_task: duplicate refusal, id parsing, focus-restore mitigation ----
+
+test_create_task_refuses_duplicate_label() {
+  local dir fb out status
+  dir="$TMP_ROOT/dup-task"; mkdir -p "$dir/responses"
+  # 1: list-tabs --json -> existing tab named fm-dup1
+  printf '[{"tab_id":2,"name":"fm-dup1","active":false}]\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-dup1 /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task should refuse an existing tab name (zellij itself does not enforce uniqueness)"
+  assert_contains "$out" "already exists" "create_task did not report the duplicate name"
+  pass "fm_backend_zellij_create_task: refuses a duplicate tab name (zellij's own new-tab has no uniqueness check)"
+}
+
+test_create_task_creates_and_parses_ids() {
+  local dir fb out
+  dir="$TMP_ROOT/create-task"; mkdir -p "$dir/responses"
+  # 1: list-tabs --json -> no existing tabs, none active
+  printf '[]\n' > "$dir/responses/1.out"
+  # 2: new-tab --cwd --name -> bare tab id on stdout
+  printf '3\n' > "$dir/responses/2.out"
+  # 3: list-panes --json -> the new tab's terminal pane
+  printf '[{"id":7,"tab_id":3,"is_plugin":false}]\n' > "$dir/responses/3.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-newtask /tmp/proj' "$ROOT" )
+  [ "$out" = "3 7" ] || fail "create_task should echo '<tab_id> <pane_id>', got '$out'"
+  assert_contains "$(cat "$dir/log")" $'\x1f''new-tab'$'\x1f''--cwd'$'\x1f''/tmp/proj'$'\x1f''--name'$'\x1f''fm-newtask' \
+    "create_task did not call new-tab with the right cwd/name"
+  pass "fm_backend_zellij_create_task: creates a tab and parses tab_id/pane_id from the response"
+}
+
+test_create_task_restores_previously_active_tab() {
+  local dir fb out
+  dir="$TMP_ROOT/focus-restore"; mkdir -p "$dir/responses"
+  # 1: list-tabs --json -> tab 0 is currently active
+  printf '[{"tab_id":0,"name":"Tab #1","active":true}]\n' > "$dir/responses/1.out"
+  # 2: new-tab -> id 4 (this steals focus on the real CLI)
+  printf '4\n' > "$dir/responses/2.out"
+  # 3: list-panes --json -> tab 4's terminal pane
+  printf '[{"id":9,"tab_id":4,"is_plugin":false}]\n' > "$dir/responses/3.out"
+  # 4: go-to-tab-by-id 0 (the restore call) - silent on success
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-focustest /tmp/proj' "$ROOT" )
+  [ "$out" = "4 9" ] || fail "create_task should still echo '<tab_id> <pane_id>', got '$out'"
+  assert_contains "$(cat "$dir/log")" $'\x1f''go-to-tab-by-id'$'\x1f''0' \
+    "create_task did not restore focus to the previously-active tab (verified real-zellij focus-steal mitigation)"
+  pass "fm_backend_zellij_create_task: restores focus to the previously-active tab after the steal-focus new-tab call"
+}
+
+test_create_task_no_restore_when_new_tab_was_already_active() {
+  local dir fb out
+  dir="$TMP_ROOT/focus-noop"; mkdir -p "$dir/responses"
+  # No active tab at all (no client attached - the common unattended case)
+  printf '[]\n' > "$dir/responses/1.out"
+  printf '5\n' > "$dir/responses/2.out"
+  printf '[{"id":11,"tab_id":5,"is_plugin":false}]\n' > "$dir/responses/3.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-noclient /tmp/proj' "$ROOT" )
+  [ "$out" = "5 11" ] || fail "create_task should still echo '<tab_id> <pane_id>', got '$out'"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''go-to-tab-by-id' \
+    "create_task should not call go-to-tab-by-id when there was no previously-active tab (no attached client)"
+  pass "fm_backend_zellij_create_task: skips the restore call when there was no previously-active tab"
+}
+
+# --- capture / send_key / send_literal / current_path / kill -----------------
+
+test_capture_calls_dump_screen_full_and_trims() {
+  local dir fb out
+  dir="$TMP_ROOT/capture"; mkdir -p "$dir/responses"
+  printf 'line one\nline two\nline three\nline four\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_capture firstmate:7 2' "$ROOT" )
+  [ "$out" = $'line three\nline four' ] || fail "capture should trim to the last N lines locally, got '$out'"
+  assert_contains "$(cat "$dir/log")" $'\x1f''dump-screen'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--full' \
+    "capture did not call dump-screen --pane-id <pane> --full"
+  pass "fm_backend_zellij_capture: calls dump-screen --full (no --lines flag exists) and trims to N lines locally"
+}
+
+test_capture_fails_when_session_absent() {
+  local dir fb out status
+  dir="$TMP_ROOT/capture-no-session"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_capture firstmate:7 5' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "capture should fail when the session does not exist (never trust the CLI's unconditional exit 0)"
+  pass "fm_backend_zellij_capture: fails when the target session is not listed as active (session_exists pre-check)"
+}
+
+test_send_key_normalizes_and_targets_pane() {
+  local dir fb
+  dir="$TMP_ROOT/sendkey"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_key firstmate:7 Escape' "$ROOT"
+  expect_code 0 $? "send_key should succeed"
+  assert_contains "$(cat "$dir/log")" $'\x1f''send-keys'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''Esc' "send_key did not normalize Escape to Esc"
+  pass "fm_backend_zellij_send_key: normalizes the key (Escape -> Esc) and targets the explicit pane id"
+}
+
+test_send_literal_uses_paste_not_write_chars() {
+  local dir fb
+  dir="$TMP_ROOT/sendliteral"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_literal firstmate:7 "hello captain"' "$ROOT"
+  expect_code 0 $? "send_literal should succeed"
+  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''hello captain' \
+    "send_literal did not call paste (bracketed paste, report's recommendation) with the explicit pane id"
+  pass "fm_backend_zellij_send_literal: calls paste (not write-chars) with the explicit pane id"
+}
+
+test_current_path_probes_with_pwd_and_scrapes_last_path_line() {
+  local dir fb out
+  # Verified real-zellij pitfall (docs/zellij-backend.md "Worktree-path
+  # discovery: pane_cwd does not track a subshell"): pane_cwd never updates
+  # once a subshell (e.g. treehouse get) takes over, so current_path actively
+  # sends `pwd` and scrapes the last absolute-path line from the capture,
+  # rather than reading a JSON field.
+  dir="$TMP_ROOT/cwd"; mkdir -p "$dir/responses"
+  # call 1: paste "pwd" (send_literal, no meaningful output)
+  # call 2: send-keys Enter (send_key, no meaningful output)
+  # call 3: dump-screen --full (the capture call current_path reads)
+  printf '%s\n' 'scratch-e2e-project HEAD' '❯ pwd' '/Users/kunchen/.treehouse/fake-worktree' 'scratch-e2e-project HEAD' '❯' \
+    > "$dir/responses/3.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_current_path firstmate:7' "$ROOT" )
+  [ "$out" = "/Users/kunchen/.treehouse/fake-worktree" ] || fail "current_path should scrape the last absolute-path line from the pwd probe, got '$out'"
+  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''pwd' "current_path did not send a pwd probe via paste"
+  assert_contains "$(cat "$dir/log")" $'\x1f''send-keys'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''Enter' "current_path did not submit the pwd probe with Enter"
+  assert_contains "$(cat "$dir/log")" $'\x1f''dump-screen'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--full' "current_path did not capture the pane after probing"
+  pass "fm_backend_zellij_current_path: actively probes with pwd and scrapes the last absolute-path line (pane_cwd cannot track a subshell)"
+}
+
+test_current_path_ignores_tilde_prefixed_banner_lines() {
+  local dir fb out
+  dir="$TMP_ROOT/cwd-tilde"; mkdir -p "$dir/responses"
+  # treehouse's own banner uses a ~-prefixed path, never a bare leading '/',
+  # so it must never be picked up as the probe's answer.
+  printf '%s\n' "🌳 Entered worktree at ~/.treehouse/scratch-e2e-project/1. Type 'exit' to return." \
+    'scratch-e2e-project HEAD' '❯ pwd' '/Users/kunchen/.treehouse/real-worktree' '❯' \
+    > "$dir/responses/3.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_current_path firstmate:7' "$ROOT" )
+  [ "$out" = "/Users/kunchen/.treehouse/real-worktree" ] || fail "current_path should skip the ~-prefixed banner line and read the pwd output, got '$out'"
+  pass "fm_backend_zellij_current_path: never picks up a ~-prefixed banner line as the answer"
+}
+
+test_kill_resolves_tab_and_closes_by_id() {
+  local dir fb
+  dir="$TMP_ROOT/kill"; mkdir -p "$dir/responses"
+  printf '[{"id":7,"tab_id":3,"is_plugin":false}]\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_kill firstmate:7' "$ROOT"
+  expect_code 0 $? "kill should succeed (best-effort)"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''3' \
+    "kill did not resolve the owning tab id and call close-tab-by-id (verified: close-pane alone leaves an empty ghost tab)"
+  pass "fm_backend_zellij_kill: resolves the owning tab id fresh and calls close-tab-by-id (never a bare close-pane)"
+}
+
+test_kill_falls_back_to_close_pane_when_tab_lookup_empty() {
+  local dir fb
+  dir="$TMP_ROOT/kill-fallback"; mkdir -p "$dir/responses"
+  printf '[]\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_kill firstmate:7' "$ROOT"
+  expect_code 0 $? "kill must stay best-effort even when the tab lookup comes up empty"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-pane'$'\x1f''--pane-id'$'\x1f''7' \
+    "kill did not fall back to a direct close-pane when no owning tab could be resolved"
+  pass "fm_backend_zellij_kill: falls back to close-pane when the owning tab cannot be resolved"
+}
+
+test_kill_is_noop_when_session_absent() {
+  local dir fb
+  dir="$TMP_ROOT/kill-no-session"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_kill firstmate:7' "$ROOT"
+  expect_code 0 $? "kill must stay best-effort (never fail) even when the session is already gone"
+  pass "fm_backend_zellij_kill: never fails when the target session no longer exists"
+}
+
+# --- send_text_submit: delta-based verify-and-retry --------------------------
+
+test_send_text_submit_detects_landed_send() {
+  local dir fb out
+  dir="$TMP_ROOT/submit-ok"; mkdir -p "$dir/responses"
+  # 1: paste (literal, no output)
+  # 2: dump-screen right after typing (the "typed" baseline)
+  printf '%s' $'❯ hello captain' > "$dir/responses/2.out"
+  # 3: send-keys enter
+  # 4: dump-screen after Enter - CHANGED (submitted)
+  printf '%s' $'hello captain\n❯' > "$dir/responses/4.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_text_submit firstmate:7 "hello captain" 3 0.01 0.01' "$ROOT" )
+  [ "$out" = empty ] || fail "send_text_submit should report empty (submitted) once the pane visibly changes, got '$out'"
+  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''hello captain' "send_text_submit did not type the literal text first"
+  pass "fm_backend_zellij_send_text_submit: reports 'empty' once the pane content changes after Enter (submitted)"
+}
+
+test_send_text_submit_detects_swallowed_enter() {
+  local dir fb out
+  dir="$TMP_ROOT/submit-swallow"; mkdir -p "$dir/responses"
+  printf '%s' $'❯ hello captain' > "$dir/responses/2.out"
+  printf '%s' $'❯ hello captain' > "$dir/responses/4.out"
+  printf '%s' $'❯ hello captain' > "$dir/responses/6.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_text_submit firstmate:7 "hello captain" 2 0.01 0.01' "$ROOT" )
+  [ "$out" = pending ] || fail "send_text_submit should report pending once retries are exhausted with no visible change, got '$out'"
+  pass "fm_backend_zellij_send_text_submit: reports 'pending' when the pane never changes after retried Enters (swallowed)"
+}
+
+test_send_text_submit_unknown_when_session_absent() {
+  local dir fb out
+  dir="$TMP_ROOT/submit-no-session"; mkdir -p "$dir/responses"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_text_submit firstmate:7 "x" 2 0.01 0.01' "$ROOT" )
+  [ "$out" = unknown ] || fail "send_text_submit should report unknown when the session does not exist, got '$out'"
+  pass "fm_backend_zellij_send_text_submit: reports 'unknown' when the target session is not active"
+}
+
+# --- fm-*.sh script routing via explicit backend-tagged meta ------------------
+
+test_scripts_route_explicit_target_through_meta_backend() {
+  local dir state fb neutral out
+  dir="$TMP_ROOT/script-explicit-target"; state="$dir/state"; mkdir -p "$state" "$dir/responses"
+  neutral="$dir/neutral-root"; mkdir -p "$neutral"
+  fm_write_meta "$state/zellij-stale.meta" "window=firstmate:7" "backend=zellij"
+  touch "$state/.last-watcher-beat"
+  printf 'captured zellij pane\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  cat > "$fb/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'tmux should not be used for a metadata-matched zellij target\n' >&2
+exit 42
+SH
+  chmod +x "$fb/tmux"
+
+  out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
+    FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
+    "$ROOT/bin/fm-peek.sh" firstmate:7 5 2>/dev/null )
+  [ "$out" = "captured zellij pane" ] || fail "fm-peek did not capture through zellij for an explicit metadata-matched target, got '$out'"
+  assert_contains "$(cat "$dir/log")" $'\x1f''dump-screen'$'\x1f''--pane-id'$'\x1f''7' \
+    "fm-peek did not route the explicit metadata-matched target through zellij capture"
+
+  : > "$dir/log"
+  PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
+    FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
+    "$ROOT/bin/fm-send.sh" firstmate:7 --key Escape >/dev/null 2>&1
+  expect_code 0 $? "fm-send --key should route an explicit metadata-matched target through zellij"
+  assert_contains "$(cat "$dir/log")" $'\x1f''send-keys'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''Esc' \
+    "fm-send did not route the explicit metadata-matched target through zellij send-key"
+
+  pass "fm-peek/fm-send: explicit metadata-matched targets use the recorded zellij backend"
+}
+
+# shellcheck source=bin/fm-backend.sh
+. "$ROOT/bin/fm-backend.sh"
+
+test_version_check_accepts_current_version
+test_version_check_accepts_newer_version
+test_version_check_refuses_old_version
+test_version_check_refuses_missing_zellij
+test_session_defaults_to_firstmate
+test_session_honors_override
+test_parse_target
+test_normalize_key
+test_session_exists_true_when_listed
+test_session_exists_false_when_absent
+test_server_ensure_skips_attach_when_already_exists
+test_dispatch_routes_zellij_backend
+test_dispatch_busy_state_unknown_for_zellij
+test_create_task_refuses_duplicate_label
+test_create_task_creates_and_parses_ids
+test_create_task_restores_previously_active_tab
+test_create_task_no_restore_when_new_tab_was_already_active
+test_capture_calls_dump_screen_full_and_trims
+test_capture_fails_when_session_absent
+test_send_key_normalizes_and_targets_pane
+test_send_literal_uses_paste_not_write_chars
+test_current_path_probes_with_pwd_and_scrapes_last_path_line
+test_current_path_ignores_tilde_prefixed_banner_lines
+test_kill_resolves_tab_and_closes_by_id
+test_kill_falls_back_to_close_pane_when_tab_lookup_empty
+test_kill_is_noop_when_session_absent
+test_send_text_submit_detects_landed_send
+test_send_text_submit_detects_swallowed_enter
+test_send_text_submit_unknown_when_session_absent
+test_scripts_route_explicit_target_through_meta_backend

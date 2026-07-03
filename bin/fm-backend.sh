@@ -12,12 +12,19 @@
 # `config/backend`, and behind runtime auto-detection when firstmate itself is
 # running inside herdr with no explicit backend setting; see herdr-addendum.md and
 # data/fm-backend-design-d7/herdr-verification-p2.md for its empirical basis.
+# P3 adds bin/backends/zellij.sh, also EXPERIMENTAL, behind `--backend
+# zellij`/`FM_BACKEND=zellij`/`config/backend` - NOT behind runtime
+# auto-detection (report.md's Open Question #2: start with a dedicated
+# background session for predictability, unlike tmux's/herdr's ambient-session
+# reuse); see report.md's "Zellij Backend" section and docs/zellij-backend.md
+# for its empirical basis.
 #
 # Compatibility contract: a task's meta may omit `backend=`; every reader here
 # treats that as `tmux` (fm_backend_of_meta), and fm-spawn.sh does not write
 # `backend=tmux` for a default-backend task, so existing and newly spawned
 # default-path metas stay byte-identical. Only a task spawned on a non-tmux
-# backend, currently experimental herdr, carries an explicit `backend=` line.
+# backend, currently experimental herdr or zellij, carries an explicit
+# `backend=` line.
 #
 # Event-source framing (herdr-addendum "Events as the core abstraction"): a
 # backend's supervision surface is conceptually an EVENT SOURCE - it produces
@@ -40,8 +47,10 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # section 4's harness-verification discipline. herdr is EXPERIMENTAL (P2;
 # data/fm-backend-design-d7/herdr-addendum.md) - verified against the real
 # v0.7.1/protocol-14 binary (data/fm-backend-design-d7/herdr-verification-p2.md)
-# but newer than tmux's long-proven default path.
-FM_BACKEND_KNOWN="tmux herdr"
+# but newer than tmux's long-proven default path. zellij is EXPERIMENTAL (P3;
+# data/fm-backend-design-d7/report.md "Zellij Backend") - verified against the
+# real 0.44.0 binary (docs/zellij-backend.md).
+FM_BACKEND_KNOWN="tmux herdr zellij"
 
 # fm_backend_is_known: 0 iff <name> has a verified adapter.
 fm_backend_is_known() {  # <name>
@@ -182,6 +191,13 @@ fm_backend_source() {  # <name>
         _FM_BACKEND_HERDR_SOURCED=1
       fi
       ;;
+    zellij)
+      if [ -z "${_FM_BACKEND_ZELLIJ_SOURCED:-}" ]; then
+        # shellcheck source=bin/backends/zellij.sh
+        . "$FM_BACKEND_LIB_DIR/backends/zellij.sh"
+        _FM_BACKEND_ZELLIJ_SOURCED=1
+      fi
+      ;;
   esac
 }
 
@@ -239,6 +255,7 @@ fm_backend_capture() {  # <backend> <target> <lines>
   case "$backend" in
     tmux) fm_backend_tmux_capture "$@" ;;
     herdr) fm_backend_herdr_capture "$@" ;;
+    zellij) fm_backend_zellij_capture "$@" ;;
     *) echo "error: no capture implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -251,6 +268,7 @@ fm_backend_send_key() {  # <backend> <target> <key>
   case "$backend" in
     tmux) fm_backend_tmux_send_key "$@" ;;
     herdr) fm_backend_herdr_send_key "$@" ;;
+    zellij) fm_backend_zellij_send_key "$@" ;;
     *) echo "error: no send-key implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -265,6 +283,7 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
   case "$backend" in
     tmux) fm_backend_tmux_send_text_submit "$@" ;;
     herdr) fm_backend_herdr_send_text_submit "$@" ;;
+    zellij) fm_backend_zellij_send_text_submit "$@" ;;
     *) echo "error: no send-text implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -279,6 +298,7 @@ fm_backend_kill() {  # <backend> <target>
   case "$backend" in
     tmux) fm_backend_tmux_kill "$@" ;;
     herdr) fm_backend_herdr_kill "$@" ;;
+    zellij) fm_backend_zellij_kill "$@" ;;
     *) echo "error: no kill implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -323,6 +343,12 @@ fm_backend_target_exists() {  # <backend> <target>
       pane=${target#*:}
       [ -n "$session" ] && [ -n "$pane" ] && [ "$pane" != "$target" ] || return 1
       HERDR_SESSION="$session" herdr pane get "$pane" >/dev/null 2>&1
+      ;;
+    zellij)
+      fm_backend_source zellij || return 1
+      fm_backend_zellij_parse_target "$target" || return 1
+      fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>/dev/null \
+        | jq -e --argjson p "$FM_BACKEND_ZELLIJ_PANE" '[.[]? | select(.id == $p and .is_plugin == false)] | length > 0' >/dev/null 2>&1
       ;;
     *)
       return 1
