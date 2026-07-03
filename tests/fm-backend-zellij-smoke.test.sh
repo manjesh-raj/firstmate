@@ -38,6 +38,10 @@ TMP_CWD="${TMPDIR:-/tmp}"
 [ -d "$TMP_CWD" ] || fail "temporary directory does not exist: $TMP_CWD"
 TMP_CWD=$(cd "$TMP_CWD" && pwd -P) || fail "could not resolve temporary directory: $TMP_CWD"
 printf -v TMP_CWD_Q '%q' "$TMP_CWD"
+LONG_CWD="$TMP_CWD/fm-zellij-wrap-$$/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccccccccccccc/dddddddddddddddddddddddddddddddddddddddd"
+mkdir -p "$LONG_CWD" || fail "could not create long cwd fixture: $LONG_CWD"
+LONG_CWD=$(cd "$LONG_CWD" && pwd -P) || fail "could not resolve long cwd fixture: $LONG_CWD"
+printf -v LONG_CWD_Q '%q' "$LONG_CWD"
 
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
@@ -74,6 +78,13 @@ if fm_backend_zellij_create_task "$SESSION" "$LABEL" /tmp >/dev/null 2>&1; then
 fi
 pass "real zellij: create_task creates a tab/pane and refuses a duplicate name"
 
+fm_backend_zellij_send_key "$TARGET" Escape "$LABEL" \
+  || fail "send_key with a matching expected task label should succeed"
+if fm_backend_zellij_send_key "$TARGET" Escape "fm-not-$LABEL" >/dev/null 2>&1; then
+  fail "send_key with a mismatched expected task label should fail"
+fi
+pass "real zellij: expected task label verification accepts the matching tab and rejects a mismatch"
+
 # --- send_literal + send_key(Enter), the two-step submit form ---------------
 
 fm_backend_zellij_send_literal "$TARGET" 'echo literal-then-key-captain' \
@@ -100,6 +111,18 @@ case "$out" in
 esac
 pass "real zellij: send_text_line composes paste+Enter and its output is capturable"
 
+out=$(fm_backend_zellij_capture "$TARGET" 40) || fail "viewport capture failed"
+case "$out" in
+  *captain-on-deck-line*) : ;;
+  *) fail "real zellij: viewport-sized capture did not include recent output"$'\n'"$out" ;;
+esac
+out=$(fm_backend_zellij_capture "$TARGET" 80) || fail "full-scrollback capture failed"
+case "$out" in
+  *captain-on-deck-line*) : ;;
+  *) fail "real zellij: full-scrollback capture did not include recent output"$'\n'"$out" ;;
+esac
+pass "real zellij: capture supports viewport-sized reads and larger full-scrollback reads"
+
 # --- current_path -------------------------------------------------------------
 
 fm_backend_zellij_send_text_line "$TARGET" "cd /tmp"
@@ -110,6 +133,12 @@ case "$p" in
   *) fail "real zellij: current_path did not report the pane's cwd after cd /tmp, got '$p'" ;;
 esac
 pass "real zellij: current_path reads the pane's live cwd after a direct cd"
+
+fm_backend_zellij_send_text_line "$TARGET" "cd $LONG_CWD_Q"
+sleep 0.3
+p_wrap=$(fm_backend_zellij_current_path "$TARGET") || fail "current_path failed for a long wrapped path"
+[ "$p_wrap" = "$LONG_CWD" ] || fail "real zellij: current_path did not reconstruct a long wrapped cwd, got '$p_wrap'"
+pass "real zellij: current_path reconstructs a long cwd that can wrap in the terminal"
 
 # The load-bearing case: a NESTED SUBSHELL's own cd (exactly what `treehouse
 # get` does). Verified real bug: zellij's `pane_cwd` JSON field stays frozen

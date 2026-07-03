@@ -172,6 +172,16 @@ fm_backend_of_selector() {  # <raw-target> <resolved-target> <state-dir>
   printf 'tmux'
 }
 
+fm_backend_expected_label_of_selector() {  # <raw-target> <state-dir>
+  local raw=$1 state=$2 meta
+  case "$raw" in
+    fm-*)
+      meta="$state/${raw#fm-}.meta"
+      [ -f "$meta" ] && printf '%s' "$raw"
+      ;;
+  esac
+}
+
 # fm_backend_source: source the named backend's adapter file, once per shell.
 fm_backend_source() {  # <name>
   local name=$1
@@ -248,7 +258,7 @@ fm_backend_resolve_selector() {  # <raw-target> <state-dir>
 # changing call sites.
 
 # fm_backend_capture: bounded plain-text session capture.
-fm_backend_capture() {  # <backend> <target> <lines>
+fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
@@ -261,7 +271,7 @@ fm_backend_capture() {  # <backend> <target> <lines>
 }
 
 # fm_backend_send_key: one named special key (Enter, Escape, C-c, ...).
-fm_backend_send_key() {  # <backend> <target> <key>
+fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
@@ -276,7 +286,7 @@ fm_backend_send_key() {  # <backend> <target> <key>
 # fm_backend_send_text_submit: type text once, then submit and verify,
 # retrying only the submission (never retyping). Echoes the verdict
 # (empty|pending|unknown|send-failed for the tmux and herdr adapters).
-fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle>
+fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
@@ -331,8 +341,8 @@ fm_backend_busy_state() {  # <backend> <target>
 # Mirrors fm-crew-state.sh's pane_readable check; exists here as one shared
 # primitive so callers that only need a fast alive/dead read (recovery
 # digests, the session-start fleet digest) do not re-derive it inline.
-fm_backend_target_exists() {  # <backend> <target>
-  local backend=$1 target=$2 session pane
+fm_backend_target_exists() {  # <backend> <target> [expected-label]
+  local backend=$1 target=$2 expected_label=${3:-} session pane
   case "$backend" in
     tmux)
       tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1
@@ -346,8 +356,7 @@ fm_backend_target_exists() {  # <backend> <target>
       ;;
     zellij)
       fm_backend_source zellij || return 1
-      fm_backend_zellij_parse_target "$target" || return 1
-      fm_backend_zellij_pane_exists "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE"
+      fm_backend_zellij_target_ready "$target" "$expected_label"
       ;;
     *)
       return 1

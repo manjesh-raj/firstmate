@@ -72,6 +72,11 @@ zellij_pane_response() {
   printf '[{"id":%s,"tab_id":%s,"is_plugin":false}]\n' "$pane" "$tab" > "$dir/responses/$n.out"
 }
 
+zellij_tab_response() {
+  local dir=$1 n=$2 tab=${3:-3} name=${4:-fm-task}
+  printf '[{"tab_id":%s,"name":"%s"}]\n' "$tab" "$name" > "$dir/responses/$n.out"
+}
+
 zellij_assert_call_order() {
   local log=$1 before=$2 after=$3 msg=$4 before_line after_line
   before_line=$(grep -anF -- "$before" "$log" | head -1 | cut -d: -f1)
@@ -293,7 +298,7 @@ test_create_task_no_restore_when_new_tab_was_already_active() {
 
 # --- capture / send_key / send_literal / current_path / kill -----------------
 
-test_capture_calls_dump_screen_full_and_trims() {
+test_capture_small_reads_use_viewport_and_trim() {
   local dir fb out
   dir="$TMP_ROOT/capture"; mkdir -p "$dir/responses"
   zellij_pane_response "$dir" 1 7 3
@@ -305,9 +310,28 @@ test_capture_calls_dump_screen_full_and_trims() {
   [ "$out" = $'line three\nline four' ] || fail "capture should trim to the last N lines locally, got '$out'"
   zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''dump-screen' \
     "capture did not verify the pane before dump-screen"
+  assert_contains "$(cat "$dir/log")" $'\x1f''dump-screen'$'\x1f''--pane-id'$'\x1f''7' \
+    "capture did not call dump-screen --pane-id <pane>"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''--full' \
+    "small capture should use zellij's viewport-only dump-screen path"
+  pass "fm_backend_zellij_capture: small reads use viewport-only dump-screen and trim to N lines locally"
+}
+
+test_capture_large_reads_use_full_scrollback_and_trim() {
+  local dir fb out
+  dir="$TMP_ROOT/capture-full"; mkdir -p "$dir/responses"
+  zellij_pane_response "$dir" 1 7 3
+  printf 'line one\nline two\nline three\nline four\n' > "$dir/responses/2.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_capture firstmate:7 80' "$ROOT" )
+  [ "$out" = $'line one\nline two\nline three\nline four' ] || fail "large capture should keep available output when fewer than N lines exist, got '$out'"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''dump-screen' \
+    "large capture did not verify the pane before dump-screen"
   assert_contains "$(cat "$dir/log")" $'\x1f''dump-screen'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--full' \
-    "capture did not call dump-screen --pane-id <pane> --full"
-  pass "fm_backend_zellij_capture: calls dump-screen --full (no --lines flag exists) and trims to N lines locally"
+    "large capture did not request --full scrollback"
+  pass "fm_backend_zellij_capture: reads above the watcher-size threshold request --full scrollback"
 }
 
 test_capture_fails_when_pane_absent() {
@@ -368,6 +392,41 @@ test_send_literal_uses_paste_separator_for_option_shaped_text() {
   pass "fm_backend_zellij_send_literal: calls paste with an explicit pane id and a -- separator"
 }
 
+test_expected_label_allows_matching_task_tab() {
+  local dir fb
+  dir="$TMP_ROOT/label-match"; mkdir -p "$dir/responses"
+  zellij_pane_response "$dir" 1 7 3
+  zellij_tab_response "$dir" 2 3 fm-label
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_key firstmate:7 Escape fm-label' "$ROOT"
+  expect_code 0 $? "send_key should succeed when the pane belongs to the expected fm-id tab"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''list-tabs'$'\x1f''--json' \
+    "expected-label readiness did not resolve the pane's owning tab before label verification"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-tabs'$'\x1f''--json' $'\x1f''send-keys' \
+    "send_key ran before verifying the owning tab label"
+  pass "fm_backend_zellij_target_ready: expected labels allow matching fm-<id> tabs"
+}
+
+test_expected_label_rejects_reused_pane_id() {
+  local dir fb status
+  dir="$TMP_ROOT/label-mismatch"; mkdir -p "$dir/responses"
+  zellij_pane_response "$dir" 1 7 3
+  zellij_tab_response "$dir" 2 3 not-the-task
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_key firstmate:7 Escape fm-label' "$ROOT"
+  status=$?
+  [ "$status" -ne 0 ] || fail "send_key should reject a pane whose tab name does not match the expected fm-id label"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''list-tabs'$'\x1f''--json' \
+    "expected-label readiness did not check the pane's owning tab"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''send-keys' \
+    "send_key should not run after expected-label readiness fails"
+  pass "fm_backend_zellij_target_ready: expected labels reject stale pane ids reused by another tab"
+}
+
 test_current_path_probes_with_marker_and_ignores_prompt_paths() {
   local dir fb out
   # Verified real-zellij pitfall (docs/zellij-backend.md "Worktree-path
@@ -382,7 +441,10 @@ test_current_path_probes_with_marker_and_ignores_prompt_paths() {
   zellij_pane_response "$dir" 6 7 3
   printf '%s\n' 'scratch-e2e-project HEAD' \
     '/Users/kunchen/src/project ❯ printf marker' \
-    '__FM_ZELLIJ_CWD__:/Users/kunchen/.treehouse/fake-worktree' \
+    '__FM_ZELLIJ_CWD_BEGIN__' \
+    '/Users/kunchen/.treehouse/fake-' \
+    'worktree' \
+    '__FM_ZELLIJ_CWD_END__' \
     '/Users/kunchen/.treehouse/fake-worktree ❯' \
     > "$dir/responses/7.out"
   fb=$(make_zellij_fakebin "$dir")
@@ -394,10 +456,11 @@ test_current_path_probes_with_marker_and_ignores_prompt_paths() {
     "current_path did not verify the pane before the cwd probe paste"
   zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''dump-screen' \
     "current_path did not verify the pane before capture"
-  assert_contains "$(cat "$dir/log")" "__FM_ZELLIJ_CWD__:%s" "current_path did not send the marked cwd probe via paste"
+  assert_contains "$(cat "$dir/log")" "__FM_ZELLIJ_CWD_BEGIN__" "current_path did not send the cwd begin marker via paste"
+  assert_contains "$(cat "$dir/log")" "pwd;" "current_path did not send the pwd probe via paste"
   assert_contains "$(cat "$dir/log")" $'\x1f''send-keys'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''Enter' "current_path did not submit the cwd probe with Enter"
   assert_contains "$(cat "$dir/log")" $'\x1f''dump-screen'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--full' "current_path did not capture the pane after probing"
-  pass "fm_backend_zellij_current_path: actively probes with a marked cwd line (pane_cwd cannot track a subshell)"
+  pass "fm_backend_zellij_current_path: actively probes with marked begin/end lines and reconstructs wrapped cwd output"
 }
 
 test_current_path_ignores_tilde_prefixed_banner_lines() {
@@ -408,7 +471,7 @@ test_current_path_ignores_tilde_prefixed_banner_lines() {
   zellij_pane_response "$dir" 4 7 3
   zellij_pane_response "$dir" 6 7 3
   printf '%s\n' "🌳 Entered worktree at ~/.treehouse/scratch-e2e-project/1. Type 'exit' to return." \
-    'scratch-e2e-project HEAD' '__FM_ZELLIJ_CWD__:/Users/kunchen/.treehouse/real-worktree' '❯' \
+    'scratch-e2e-project HEAD' '__FM_ZELLIJ_CWD_BEGIN__' '/Users/kunchen/.treehouse/real-worktree' '__FM_ZELLIJ_CWD_END__' '❯' \
     > "$dir/responses/7.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
@@ -643,6 +706,47 @@ SH
   pass "fm-peek/fm-send: explicit metadata-matched targets use the recorded zellij backend"
 }
 
+test_scripts_verify_label_for_fm_targets() {
+  local dir state fb neutral out
+  dir="$TMP_ROOT/script-fm-target-label"; state="$dir/state"; mkdir -p "$state" "$dir/responses"
+  neutral="$dir/neutral-root"; mkdir -p "$neutral"
+  fm_write_meta "$state/zlabel.meta" "window=firstmate:7" "backend=zellij"
+  touch "$state/.last-watcher-beat"
+  zellij_pane_response "$dir" 1 7 3
+  zellij_tab_response "$dir" 2 3 fm-zlabel
+  printf 'captured through fm-id\n' > "$dir/responses/3.out"
+  fb=$(make_zellij_fakebin "$dir")
+
+  out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
+    FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
+    "$ROOT/bin/fm-peek.sh" fm-zlabel 5 2>/dev/null )
+  [ "$out" = "captured through fm-id" ] || fail "fm-peek did not capture through zellij for an fm-id target with a matching tab label, got '$out'"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-tabs'$'\x1f''--json' $'\x1f''dump-screen' \
+    "fm-peek did not verify the fm-id tab label before capture"
+
+  pass "fm-peek: fm-id zellij targets verify the owning tab label before capture"
+}
+
+test_scripts_reject_fm_target_label_mismatch() {
+  local dir state fb neutral status
+  dir="$TMP_ROOT/script-fm-target-label-mismatch"; state="$dir/state"; mkdir -p "$state" "$dir/responses"
+  neutral="$dir/neutral-root"; mkdir -p "$neutral"
+  fm_write_meta "$state/zreuse.meta" "window=firstmate:7" "backend=zellij"
+  touch "$state/.last-watcher-beat"
+  zellij_pane_response "$dir" 1 7 3
+  zellij_tab_response "$dir" 2 3 not-the-task
+  fb=$(make_zellij_fakebin "$dir")
+
+  PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
+    FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
+    "$ROOT/bin/fm-send.sh" fm-zreuse --key Escape >/dev/null 2>&1
+  status=$?
+  [ "$status" -ne 0 ] || fail "fm-send --key should reject an fm-id zellij target whose pane belongs to a differently named tab"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''send-keys' \
+    "fm-send should not send a key after fm-id label verification fails"
+  pass "fm-send: fm-id zellij targets reject pane ids whose tab label no longer matches"
+}
+
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 
@@ -663,11 +767,14 @@ test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
 test_create_task_restores_previously_active_tab
 test_create_task_no_restore_when_new_tab_was_already_active
-test_capture_calls_dump_screen_full_and_trims
+test_capture_small_reads_use_viewport_and_trim
+test_capture_large_reads_use_full_scrollback_and_trim
 test_capture_fails_when_pane_absent
 test_capture_fails_when_session_absent
 test_send_key_normalizes_and_targets_pane
 test_send_literal_uses_paste_separator_for_option_shaped_text
+test_expected_label_allows_matching_task_tab
+test_expected_label_rejects_reused_pane_id
 test_current_path_probes_with_marker_and_ignores_prompt_paths
 test_current_path_ignores_tilde_prefixed_banner_lines
 test_kill_resolves_tab_and_closes_by_id
@@ -681,3 +788,5 @@ test_send_text_submit_detects_swallowed_enter
 test_send_text_submit_send_failed_when_session_absent
 test_send_text_submit_send_failed_when_pane_absent
 test_scripts_route_explicit_target_through_meta_backend
+test_scripts_verify_label_for_fm_targets
+test_scripts_reject_fm_target_label_mismatch

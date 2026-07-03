@@ -62,12 +62,13 @@
 #     neither stream). The exit code can NEVER be trusted to detect a bad
 #     target. Mitigated: send/capture/cwd ops verify session liveness first
 #     (fm_backend_zellij_session_exists, a passive list-sessions query, never
-#     auto-creating) and verify the specific pane still appears in list-panes
-#     JSON before use. Kill verifies the session and, when teardown supplies
-#     an expected tab label, verifies a tab id still has that label before
-#     closing it. Output-SHAPE validation (a bare integer tab id, JSON that
-#     parses) rejects the "session not found" text fallback. A pane can
-#     still die between the preflight check and the operation call;
+#     auto-creating), verify the specific pane still appears in list-panes JSON,
+#     and, for metadata-routed fm-<id> operations, verify the pane's tab still
+#     has the expected task label before use. Kill verifies the session and,
+#     when teardown supplies an expected tab label, verifies a tab id still has
+#     that label before closing it. Output-SHAPE validation (a bare integer tab
+#     id, JSON that parses) rejects the "session not found" text fallback. A
+#     pane can still die between the preflight check and the operation call;
 #     docs/zellij-backend.md records that residual race.
 #   - `zellij list-tabs`/`new-tab` does NOT enforce unique tab names (same as
 #     herdr's tabs, unlike tmux's own window-name uniqueness), so the
@@ -287,10 +288,18 @@ fm_backend_zellij_parse_target() {  # <target>
 }
 
 # fm_backend_zellij_target_ready: parse the target and verify its session and
-# pane are alive. Never creates (fm_backend_zellij_session_exists' rationale above).
-fm_backend_zellij_target_ready() {  # <target>
+# pane are alive. When the caller knows the owning firstmate task label, verify
+# the pane belongs to that named tab before trusting the numeric pane id.
+fm_backend_zellij_target_ready() {  # <target> [expected-label]
+  local expected_label=${2:-} tab_id
   fm_backend_zellij_parse_target "$1" || return 1
   fm_backend_zellij_session_exists "$FM_BACKEND_ZELLIJ_SESSION" || return 1
+  if [ -n "$expected_label" ]; then
+    tab_id=$(fm_backend_zellij_tab_for_pane "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE" 2>/dev/null)
+    [ -n "$tab_id" ] || return 1
+    fm_backend_zellij_tab_matches_name "$FM_BACKEND_ZELLIJ_SESSION" "$tab_id" "$expected_label"
+    return $?
+  fi
   fm_backend_zellij_pane_exists "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE"
 }
 
@@ -313,16 +322,24 @@ fm_backend_zellij_target_ready() {  # <target>
 # poll loop (the only caller of this op), where injecting a harmless extra
 # command before the harness ever launches is an acceptable trade for a reliable
 # answer.
-fm_backend_zellij_current_path() {  # <target>
-  local target=$1 out line marker="__FM_ZELLIJ_CWD__:" last=""
-  fm_backend_zellij_target_ready "$target" || return 0
-  fm_backend_zellij_send_text_line "$target" "printf '${marker}%s\n' \"\$PWD\"" || return 0
+fm_backend_zellij_current_path() {  # <target> [expected-label]
+  local target=$1 expected_label=${2:-} out line marker_begin="__FM_ZELLIJ_CWD_BEGIN__" marker_end="__FM_ZELLIJ_CWD_END__" in_block=0 chunk="" last=""
+  fm_backend_zellij_target_ready "$target" "$expected_label" || return 0
+  fm_backend_zellij_send_text_line "$target" "printf '%s\n' '$marker_begin'; pwd; printf '%s\n' '$marker_end'" "$expected_label" || return 0
   sleep 0.3
-  out=$(fm_backend_zellij_capture "$target" 15) || return 0
+  out=$(fm_backend_zellij_capture "$target" 200 "$expected_label") || return 0
   while IFS= read -r line; do
-    case "$line" in
-      "$marker"/*) last=${line#"$marker"} ;;
-    esac
+    if [ "$line" = "$marker_begin" ]; then
+      in_block=1
+      chunk=""
+      continue
+    fi
+    if [ "$line" = "$marker_end" ]; then
+      case "$chunk" in /*) last=$chunk ;; esac
+      in_block=0
+      continue
+    fi
+    [ "$in_block" -eq 1 ] && chunk="$chunk$line"
   done <<EOF
 $out
 EOF
@@ -334,8 +351,8 @@ EOF
 # `send-keys -t T -l text` / herdr's `pane send-text`. Verified: `action
 # paste` does NOT auto-submit and uses bracketed paste mode (the report's
 # recommendation over write-chars, for popup-safety parity with tmux/herdr).
-fm_backend_zellij_send_literal() {  # <target> <text>
-  fm_backend_zellij_target_ready "$1" || return 1
+fm_backend_zellij_send_literal() {  # <target> <text> [expected-label]
+  fm_backend_zellij_target_ready "$1" "${3:-}" || return 1
   fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action paste --pane-id "$FM_BACKEND_ZELLIJ_PANE" -- "$2" >/dev/null 2>&1
 }
 
@@ -358,8 +375,8 @@ fm_backend_zellij_normalize_key() {  # <key>
 # fm_backend_zellij_send_key: one named special key, targeted at the pane by
 # its EXPLICIT --pane-id (never the ambient "focused pane" default - verified
 # unreliable, see file header). Mirrors fm-send.sh's --key path.
-fm_backend_zellij_send_key() {  # <target> <key>
-  fm_backend_zellij_target_ready "$1" || return 1
+fm_backend_zellij_send_key() {  # <target> <key> [expected-label]
+  fm_backend_zellij_target_ready "$1" "${3:-}" || return 1
   local key
   key=$(fm_backend_zellij_normalize_key "$2")
   fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action send-keys --pane-id "$FM_BACKEND_ZELLIJ_PANE" "$key" >/dev/null 2>&1
@@ -372,23 +389,25 @@ fm_backend_zellij_send_key() {  # <target> <key>
 # composes paste (literal) + send-keys Enter, exactly like send_literal +
 # send_key are composed elsewhere - the two-step form is the ONLY form for
 # this adapter, unlike tmux/herdr which have a genuinely atomic primitive.
-fm_backend_zellij_send_text_line() {  # <target> <text>
-  fm_backend_zellij_send_literal "$1" "$2" || return 1
-  fm_backend_zellij_send_key "$1" Enter
+fm_backend_zellij_send_text_line() {  # <target> <text> [expected-label]
+  fm_backend_zellij_send_literal "$1" "$2" "${3:-}" || return 1
+  fm_backend_zellij_send_key "$1" Enter "${3:-}"
 }
 
 # fm_backend_zellij_capture: bounded plain-text pane capture. Mirrors
 # fm-peek.sh's/fm-watch.sh's `tmux capture-pane -p -t T -S -N`. `dump-screen`
-# has no --lines bound (unlike herdr's buggy small-N --lines) - it always
-# dumps the full viewport, or full scrollback with --full - so this always
-# requests --full and trims to the caller's bound locally with `tail`,
-# structurally similar to herdr's over-fetch-and-trim workaround but for a
-# different underlying reason (no bound flag exists at all, not a bug in one).
-fm_backend_zellij_capture() {  # <target> <lines>
-  fm_backend_zellij_target_ready "$1" || return 1
+# has no --lines bound, so routine 40-line-or-smaller reads use the current
+# viewport and larger explicit reads use --full scrollback, then trim locally.
+# On a very short viewport, a small read can see fewer than the requested lines.
+fm_backend_zellij_capture() {  # <target> <lines> [expected-label]
+  fm_backend_zellij_target_ready "$1" "${3:-}" || return 1
   local lines=${2:-40} out
   case "$lines" in ''|*[!0-9]*) lines=40 ;; esac
-  out=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action dump-screen --pane-id "$FM_BACKEND_ZELLIJ_PANE" --full 2>/dev/null) || return 1
+  if [ "$lines" -le 40 ]; then
+    out=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action dump-screen --pane-id "$FM_BACKEND_ZELLIJ_PANE" 2>/dev/null) || return 1
+  else
+    out=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action dump-screen --pane-id "$FM_BACKEND_ZELLIJ_PANE" --full 2>/dev/null) || return 1
+  fi
   printf '%s' "$out" | tail -n "$lines"
 }
 
@@ -404,15 +423,15 @@ fm_backend_zellij_capture() {  # <target> <lines>
 # target never shows a change, so it correctly reports pending/unknown rather
 # than a false "sent". Echoes empty|pending|unknown|send-failed, the SAME
 # vocabulary fm-send.sh already branches on for tmux and herdr.
-fm_backend_zellij_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
-  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 typed after i=0
-  fm_backend_zellij_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
+fm_backend_zellij_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label]
+  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 expected_label=${6:-} typed after i=0
+  fm_backend_zellij_send_literal "$target" "$text" "$expected_label" || { printf 'send-failed'; return 0; }
   sleep "$settle"
-  typed=$(fm_backend_zellij_capture "$target" 6) || { printf 'unknown'; return 0; }
+  typed=$(fm_backend_zellij_capture "$target" 6 "$expected_label") || { printf 'unknown'; return 0; }
   while :; do
-    fm_backend_zellij_send_key "$target" Enter || true
+    fm_backend_zellij_send_key "$target" Enter "$expected_label" || true
     sleep "$sleep_s"
-    after=$(fm_backend_zellij_capture "$target" 6) || { printf 'unknown'; return 0; }
+    after=$(fm_backend_zellij_capture "$target" 6 "$expected_label") || { printf 'unknown'; return 0; }
     if [ "$after" != "$typed" ]; then
       printf 'empty'
       return 0
