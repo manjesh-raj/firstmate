@@ -63,10 +63,10 @@
 #     target. Mitigated: send/capture/cwd ops verify session liveness first
 #     (fm_backend_zellij_session_exists, a passive list-sessions query, never
 #     auto-creating) and verify the specific pane still appears in list-panes
-#     JSON before use. Kill verifies the session and closes the recorded tab id
-#     when teardown supplies one, so an already-gone pane cannot leave an empty
-#     ghost tab behind. Output-SHAPE validation (a bare integer tab id, JSON
-#     that parses) rejects the "session not found" text fallback. A pane can
+#     JSON before use. Kill verifies the session and, when teardown supplies
+#     an expected tab label, verifies a tab id still has that label before
+#     closing it. Output-SHAPE validation (a bare integer tab id, JSON that
+#     parses) rejects the "session not found" text fallback. A pane can
 #     still die between the preflight check and the operation call;
 #     docs/zellij-backend.md records that residual race.
 #   - `zellij list-tabs`/`new-tab` does NOT enforce unique tab names (same as
@@ -225,6 +225,12 @@ fm_backend_zellij_pane_exists() {  # <session> <pane_id>
   local session=$1 pane_id=$2
   fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null \
     | jq -e --argjson p "$pane_id" '[.[]? | select(.id == $p and .is_plugin == false)] | length > 0' >/dev/null 2>&1
+}
+
+fm_backend_zellij_tab_matches_name() {  # <session> <tab_id> <name>
+  local session=$1 tab_id=$2 name=$3
+  fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null \
+    | jq -e --argjson t "$tab_id" --arg want "$name" '[.[]? | select(.tab_id == $t and .name == $want)] | length > 0' >/dev/null 2>&1
 }
 
 # fm_backend_zellij_create_task: create the task's tab (one terminal pane) in
@@ -422,22 +428,30 @@ fm_backend_zellij_send_text_submit() {  # <target> <text> <retries> <enter-sleep
 # empty tab survives in list-tabs); `close-tab-by-id` on a live tab DOES
 # cleanly remove both the pane and the tab in one call, verified to need no
 # separate pane-close first. The owning tab id is looked up fresh from the
-# pane id when possible via fm_backend_zellij_tab_for_pane; if that lookup comes
-# up empty because the pane is already gone, teardown passes the recorded tab id
-# as a fallback. Without a tab id, kill falls back to a direct close-pane attempt
-# so it is never a hard no-op.
-fm_backend_zellij_kill() {  # <target> [tab_id]
+# pane id when possible via fm_backend_zellij_tab_for_pane; teardown also
+# passes the recorded tab id and expected tab label for already-empty ghost
+# tabs. Any tab id is verified against the expected label when one is provided.
+fm_backend_zellij_kill() {  # <target> [tab_id] [expected_label]
   fm_backend_zellij_parse_target "$1" || return 0
   fm_backend_zellij_session_exists "$FM_BACKEND_ZELLIJ_SESSION" || return 0
-  local tab_id fallback_tab_id=${2:-}
+  local tab_id fallback_tab_id=${2:-} expected_label=${3:-}
   tab_id=$(fm_backend_zellij_tab_for_pane "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE" 2>/dev/null)
+  if [ -n "$tab_id" ] && [ -n "$expected_label" ] && ! fm_backend_zellij_tab_matches_name "$FM_BACKEND_ZELLIJ_SESSION" "$tab_id" "$expected_label"; then
+    tab_id=
+  fi
   case "$fallback_tab_id" in
     ''|*[!0-9]*) ;;
-    *) [ -n "$tab_id" ] || tab_id=$fallback_tab_id ;;
+    *)
+      if [ -z "$tab_id" ]; then
+        if [ -z "$expected_label" ] || fm_backend_zellij_tab_matches_name "$FM_BACKEND_ZELLIJ_SESSION" "$fallback_tab_id" "$expected_label"; then
+          tab_id=$fallback_tab_id
+        fi
+      fi
+      ;;
   esac
   if [ -n "$tab_id" ]; then
     fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action close-tab-by-id "$tab_id" >/dev/null 2>&1 || true
-  else
+  elif [ -z "$expected_label" ]; then
     fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action close-pane --pane-id "$FM_BACKEND_ZELLIJ_PANE" >/dev/null 2>&1 || true
   fi
 }

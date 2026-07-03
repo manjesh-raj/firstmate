@@ -34,6 +34,11 @@ cleanup_all() {
   zellij_safe_delete "$SESSION"
 }
 
+TMP_CWD="${TMPDIR:-/tmp}"
+[ -d "$TMP_CWD" ] || fail "temporary directory does not exist: $TMP_CWD"
+TMP_CWD=$(cd "$TMP_CWD" && pwd -P) || fail "could not resolve temporary directory: $TMP_CWD"
+printf -v TMP_CWD_Q '%q' "$TMP_CWD"
+
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 fm_backend_source zellij || fail "fm_backend_source zellij failed"
@@ -116,13 +121,10 @@ pass "real zellij: current_path reads the pane's live cwd after a direct cd"
 # not just a plain cd in the pane's own top-level shell (the case above).
 fm_backend_zellij_send_text_line "$TARGET" 'cd / && bash'
 sleep 0.5
-fm_backend_zellij_send_text_line "$TARGET" "cd /private/tmp"
+fm_backend_zellij_send_text_line "$TARGET" "cd $TMP_CWD_Q"
 sleep 0.3
 p2=$(fm_backend_zellij_current_path "$TARGET") || fail "current_path failed inside a nested subshell"
-case "$p2" in
-  */private/tmp) : ;;
-  *) fail "real zellij: current_path did not track a nested subshell's own cd (the treehouse-get-shaped case), got '$p2'" ;;
-esac
+[ "$p2" = "$TMP_CWD" ] || fail "real zellij: current_path did not track a nested subshell's own cd (the treehouse-get-shaped case), got '$p2'"
 pass "real zellij: current_path tracks a NESTED SUBSHELL's own cd (the treehouse-get-shaped case a bare pane_cwd read cannot see)"
 fm_backend_zellij_send_text_line "$TARGET" 'exit'
 sleep 0.3

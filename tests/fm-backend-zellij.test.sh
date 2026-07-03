@@ -455,18 +455,40 @@ test_kill_closes_recorded_tab_when_pane_already_gone() {
   local dir fb
   dir="$TMP_ROOT/kill-recorded-tab"; mkdir -p "$dir/responses"
   printf '[]\n' > "$dir/responses/1.out"
+  printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/2.out"
   fb=$(make_zellij_fakebin "$dir")
   PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
-    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_kill firstmate:7 3' "$ROOT"
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_kill firstmate:7 3 fm-zghost' "$ROOT"
   expect_code 0 $? "kill must stay best-effort even when only the recorded tab id is usable"
-  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''close-tab-by-id' \
-    "kill did not try pane lookup before falling back to the recorded tab id"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''list-tabs'$'\x1f''--json' \
+    "kill did not verify the recorded tab id by label before closing it"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-tabs'$'\x1f''--json' $'\x1f''close-tab-by-id' \
+    "kill closed the recorded tab id before verifying its label"
   assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''3' \
-    "kill did not close the recorded tab id when the pane was already gone"
+    "kill did not close the verified recorded tab id when the pane was already gone"
   assert_not_contains "$(cat "$dir/log")" $'\x1f''close-pane' \
-    "kill should close the recorded tab id instead of leaving an empty ghost tab"
-  pass "fm_backend_zellij_kill: closes the recorded tab id when the pane is already gone"
+    "kill should close the verified recorded tab id instead of leaving an empty ghost tab"
+  pass "fm_backend_zellij_kill: closes the recorded tab id only after label verification"
+}
+
+test_kill_skips_recorded_tab_when_label_mismatches() {
+  local dir fb
+  dir="$TMP_ROOT/kill-recorded-tab-mismatch"; mkdir -p "$dir/responses"
+  printf '[]\n' > "$dir/responses/1.out"
+  printf '[{"tab_id":3,"name":"not-the-task"}]\n' > "$dir/responses/2.out"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_kill firstmate:7 3 fm-zghost' "$ROOT"
+  expect_code 0 $? "kill must stay best-effort when the recorded tab id no longer belongs to the task"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''list-tabs'$'\x1f''--json' \
+    "kill did not verify the recorded tab id by label"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id' \
+    "kill should not close a recorded tab id whose name does not match the task"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''close-pane' \
+    "kill should not fall back to closing a pane once an expected task label is available"
+  pass "fm_backend_zellij_kill: skips a stale recorded tab id whose label does not match"
 }
 
 test_kill_is_noop_when_session_absent() {
@@ -492,17 +514,20 @@ test_teardown_passes_recorded_tab_id_to_zellij_kill() {
     "project=$project" \
     "kind=scout"
   printf '[]\n' > "$dir/responses/1.out"
+  printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/2.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
     "$ROOT/bin/fm-teardown.sh" zghost 2>&1 )
   status=$?
   expect_code 0 "$status" "fm-teardown should succeed for a zellij scout whose worktree is already gone: $out"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''list-tabs'$'\x1f''--json' \
+    "fm-teardown did not verify the recorded zellij_tab_id against the task label"
   assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''3' \
-    "fm-teardown did not pass the recorded zellij_tab_id through to kill"
+    "fm-teardown did not pass a verified recorded zellij_tab_id through to kill"
   assert_not_contains "$(cat "$dir/log")" $'\x1f''close-pane' \
     "fm-teardown should close the recorded tab id instead of falling back to close-pane"
-  pass "fm-teardown.sh: passes recorded zellij_tab_id so dead-pane ghost tabs are closed"
+  pass "fm-teardown.sh: passes recorded zellij_tab_id with the expected task label"
 }
 
 # --- send_text_submit: delta-based verify-and-retry --------------------------
@@ -648,6 +673,7 @@ test_current_path_ignores_tilde_prefixed_banner_lines
 test_kill_resolves_tab_and_closes_by_id
 test_kill_falls_back_to_close_pane_when_tab_lookup_empty
 test_kill_closes_recorded_tab_when_pane_already_gone
+test_kill_skips_recorded_tab_when_label_mismatches
 test_kill_is_noop_when_session_absent
 test_teardown_passes_recorded_tab_id_to_zellij_kill
 test_send_text_submit_detects_landed_send
