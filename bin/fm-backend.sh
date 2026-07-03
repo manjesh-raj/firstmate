@@ -347,8 +347,7 @@ fm_backend_target_exists() {  # <backend> <target>
     zellij)
       fm_backend_source zellij || return 1
       fm_backend_zellij_parse_target "$target" || return 1
-      fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>/dev/null \
-        | jq -e --argjson p "$FM_BACKEND_ZELLIJ_PANE" '[.[]? | select(.id == $p and .is_plugin == false)] | length > 0' >/dev/null 2>&1
+      fm_backend_zellij_pane_exists "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE"
       ;;
     *)
       return 1

@@ -62,14 +62,11 @@
 #     neither stream). The exit code can NEVER be trusted to detect a bad
 #     target. Mitigated: every op below verifies session liveness first
 #     (fm_backend_zellij_session_exists, a passive list-sessions query, never
-#     auto-creating), and output-SHAPE validation (a bare integer tab id, JSON
-#     that parses) rejects the "session not found" text fallback. A stale-
-#     but-live-session dead PANE id is not detectable at the CLI layer at all
-#     (send/key calls silently no-op); this residual gap is accepted and
-#     documented in docs/zellij-backend.md - it degrades to the same "the
-#     operation quietly did nothing, a downstream poll or the watcher's
-#     stale-pane detection eventually notices" behavior firstmate already
-#     tolerates for an unverified send on any backend.
+#     auto-creating) and verifies the specific pane still appears in
+#     list-panes JSON before use. Output-SHAPE validation (a bare integer tab
+#     id, JSON that parses) rejects the "session not found" text fallback. A
+#     pane can still die between the preflight check and the operation call;
+#     docs/zellij-backend.md records that residual race.
 #   - `zellij list-tabs`/`new-tab` does NOT enforce unique tab names (same as
 #     herdr's tabs, unlike tmux's own window-name uniqueness), so the
 #     duplicate check below is ours, mirroring both prior adapters.
@@ -222,6 +219,12 @@ fm_backend_zellij_tab_for_pane() {  # <session> <pane_id>
     | jq -r --argjson p "$pane_id" '.[]? | select(.id == $p and .is_plugin == false) | .tab_id' 2>/dev/null | head -1
 }
 
+fm_backend_zellij_pane_exists() {  # <session> <pane_id>
+  local session=$1 pane_id=$2
+  fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null \
+    | jq -e --argjson p "$pane_id" '[.[]? | select(.id == $p and .is_plugin == false)] | length > 0' >/dev/null 2>&1
+}
+
 # fm_backend_zellij_create_task: create the task's tab (one terminal pane) in
 # <session>, refusing an existing <label>. Zellij does NOT enforce tab-name
 # uniqueness itself (verified: two tabs can share a name), so the duplicate
@@ -275,11 +278,12 @@ fm_backend_zellij_parse_target() {  # <target>
   [ -n "$FM_BACKEND_ZELLIJ_SESSION" ] && [ -n "$FM_BACKEND_ZELLIJ_PANE" ] && [ "$FM_BACKEND_ZELLIJ_PANE" != "$target" ]
 }
 
-# fm_backend_zellij_target_ready: parse the target and verify its session is
-# alive. Never creates (fm_backend_zellij_session_exists' rationale above).
+# fm_backend_zellij_target_ready: parse the target and verify its session and
+# pane are alive. Never creates (fm_backend_zellij_session_exists' rationale above).
 fm_backend_zellij_target_ready() {  # <target>
   fm_backend_zellij_parse_target "$1" || return 1
-  fm_backend_zellij_session_exists "$FM_BACKEND_ZELLIJ_SESSION"
+  fm_backend_zellij_session_exists "$FM_BACKEND_ZELLIJ_SESSION" || return 1
+  fm_backend_zellij_pane_exists "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE"
 }
 
 # fm_backend_zellij_current_path: the live pane's cwd, or empty on any error.
