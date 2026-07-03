@@ -368,33 +368,36 @@ test_send_literal_uses_paste_separator_for_option_shaped_text() {
   pass "fm_backend_zellij_send_literal: calls paste with an explicit pane id and a -- separator"
 }
 
-test_current_path_probes_with_pwd_and_scrapes_last_path_line() {
+test_current_path_probes_with_marker_and_ignores_prompt_paths() {
   local dir fb out
   # Verified real-zellij pitfall (docs/zellij-backend.md "Worktree-path
   # discovery: pane_cwd does not track a subshell"): pane_cwd never updates
   # once a subshell (e.g. treehouse get) takes over, so current_path actively
-  # sends `pwd` and scrapes the last absolute-path line from the capture,
+  # prints a marked cwd line and reads only that marker from the capture,
   # rather than reading a JSON field.
   dir="$TMP_ROOT/cwd"; mkdir -p "$dir/responses"
   zellij_pane_response "$dir" 1 7 3
   zellij_pane_response "$dir" 2 7 3
   zellij_pane_response "$dir" 4 7 3
   zellij_pane_response "$dir" 6 7 3
-  printf '%s\n' 'scratch-e2e-project HEAD' '❯ pwd' '/Users/kunchen/.treehouse/fake-worktree' 'scratch-e2e-project HEAD' '❯' \
+  printf '%s\n' 'scratch-e2e-project HEAD' \
+    '/Users/kunchen/src/project ❯ printf marker' \
+    '__FM_ZELLIJ_CWD__:/Users/kunchen/.treehouse/fake-worktree' \
+    '/Users/kunchen/.treehouse/fake-worktree ❯' \
     > "$dir/responses/7.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
     bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_current_path firstmate:7' "$ROOT" )
-  [ "$out" = "/Users/kunchen/.treehouse/fake-worktree" ] || fail "current_path should scrape the last absolute-path line from the pwd probe, got '$out'"
+  [ "$out" = "/Users/kunchen/.treehouse/fake-worktree" ] || fail "current_path should read only the marked cwd line, got '$out'"
   zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''paste' \
-    "current_path did not verify the pane before the pwd paste"
+    "current_path did not verify the pane before the cwd probe paste"
   zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''dump-screen' \
     "current_path did not verify the pane before capture"
-  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--'$'\x1f''pwd' "current_path did not send a pwd probe via paste"
-  assert_contains "$(cat "$dir/log")" $'\x1f''send-keys'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''Enter' "current_path did not submit the pwd probe with Enter"
+  assert_contains "$(cat "$dir/log")" "__FM_ZELLIJ_CWD__:%s" "current_path did not send the marked cwd probe via paste"
+  assert_contains "$(cat "$dir/log")" $'\x1f''send-keys'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''Enter' "current_path did not submit the cwd probe with Enter"
   assert_contains "$(cat "$dir/log")" $'\x1f''dump-screen'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--full' "current_path did not capture the pane after probing"
-  pass "fm_backend_zellij_current_path: actively probes with pwd and scrapes the last absolute-path line (pane_cwd cannot track a subshell)"
+  pass "fm_backend_zellij_current_path: actively probes with a marked cwd line (pane_cwd cannot track a subshell)"
 }
 
 test_current_path_ignores_tilde_prefixed_banner_lines() {
@@ -404,16 +407,14 @@ test_current_path_ignores_tilde_prefixed_banner_lines() {
   zellij_pane_response "$dir" 2 7 3
   zellij_pane_response "$dir" 4 7 3
   zellij_pane_response "$dir" 6 7 3
-  # treehouse's own banner uses a ~-prefixed path, never a bare leading '/',
-  # so it must never be picked up as the probe's answer.
   printf '%s\n' "🌳 Entered worktree at ~/.treehouse/scratch-e2e-project/1. Type 'exit' to return." \
-    'scratch-e2e-project HEAD' '❯ pwd' '/Users/kunchen/.treehouse/real-worktree' '❯' \
+    'scratch-e2e-project HEAD' '__FM_ZELLIJ_CWD__:/Users/kunchen/.treehouse/real-worktree' '❯' \
     > "$dir/responses/7.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
     bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_current_path firstmate:7' "$ROOT" )
-  [ "$out" = "/Users/kunchen/.treehouse/real-worktree" ] || fail "current_path should skip the ~-prefixed banner line and read the pwd output, got '$out'"
+  [ "$out" = "/Users/kunchen/.treehouse/real-worktree" ] || fail "current_path should skip the ~-prefixed banner line and read the marked cwd output, got '$out'"
   pass "fm_backend_zellij_current_path: never picks up a ~-prefixed banner line as the answer"
 }
 
@@ -437,8 +438,7 @@ test_kill_resolves_tab_and_closes_by_id() {
 test_kill_falls_back_to_close_pane_when_tab_lookup_empty() {
   local dir fb
   dir="$TMP_ROOT/kill-fallback"; mkdir -p "$dir/responses"
-  zellij_pane_response "$dir" 1 7 3
-  printf '[]\n' > "$dir/responses/2.out"
+  printf '[]\n' > "$dir/responses/1.out"
   fb=$(make_zellij_fakebin "$dir")
   PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
@@ -449,6 +449,24 @@ test_kill_falls_back_to_close_pane_when_tab_lookup_empty() {
   assert_contains "$(cat "$dir/log")" $'\x1f''close-pane'$'\x1f''--pane-id'$'\x1f''7' \
     "kill did not fall back to a direct close-pane when no owning tab could be resolved"
   pass "fm_backend_zellij_kill: falls back to close-pane when the owning tab cannot be resolved"
+}
+
+test_kill_closes_recorded_tab_when_pane_already_gone() {
+  local dir fb
+  dir="$TMP_ROOT/kill-recorded-tab"; mkdir -p "$dir/responses"
+  printf '[]\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_kill firstmate:7 3' "$ROOT"
+  expect_code 0 $? "kill must stay best-effort even when only the recorded tab id is usable"
+  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''close-tab-by-id' \
+    "kill did not try pane lookup before falling back to the recorded tab id"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''3' \
+    "kill did not close the recorded tab id when the pane was already gone"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''close-pane' \
+    "kill should close the recorded tab id instead of leaving an empty ghost tab"
+  pass "fm_backend_zellij_kill: closes the recorded tab id when the pane is already gone"
 }
 
 test_kill_is_noop_when_session_absent() {
@@ -462,18 +480,42 @@ test_kill_is_noop_when_session_absent() {
   pass "fm_backend_zellij_kill: never fails when the target session no longer exists"
 }
 
+test_teardown_passes_recorded_tab_id_to_zellij_kill() {
+  local dir state data config project fb out status
+  dir="$TMP_ROOT/teardown-zellij-ghost"; state="$dir/state"; data="$dir/data"; config="$dir/config"; project="$dir/project"
+  mkdir -p "$state" "$data" "$config" "$project" "$dir/responses"
+  fm_write_meta "$state/zghost.meta" \
+    "window=firstmate:7" \
+    "backend=zellij" \
+    "zellij_tab_id=3" \
+    "worktree=$dir/missing-worktree" \
+    "project=$project" \
+    "kind=scout"
+  printf '[]\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
+    "$ROOT/bin/fm-teardown.sh" zghost 2>&1 )
+  status=$?
+  expect_code 0 "$status" "fm-teardown should succeed for a zellij scout whose worktree is already gone: $out"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''3' \
+    "fm-teardown did not pass the recorded zellij_tab_id through to kill"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''close-pane' \
+    "fm-teardown should close the recorded tab id instead of falling back to close-pane"
+  pass "fm-teardown.sh: passes recorded zellij_tab_id so dead-pane ghost tabs are closed"
+}
+
 # --- send_text_submit: delta-based verify-and-retry --------------------------
 
 test_send_text_submit_detects_landed_send() {
   local dir fb out
   dir="$TMP_ROOT/submit-ok"; mkdir -p "$dir/responses"
   zellij_pane_response "$dir" 1 7 3
-  zellij_pane_response "$dir" 2 7 3
-  zellij_pane_response "$dir" 4 7 3
-  zellij_pane_response "$dir" 6 7 3
-  zellij_pane_response "$dir" 8 7 3
-  printf '%s' $'❯ hello captain' > "$dir/responses/5.out"
-  printf '%s' $'hello captain\n❯' > "$dir/responses/9.out"
+  zellij_pane_response "$dir" 3 7 3
+  zellij_pane_response "$dir" 5 7 3
+  zellij_pane_response "$dir" 7 7 3
+  printf '%s' $'❯ hello captain' > "$dir/responses/4.out"
+  printf '%s' $'hello captain\n❯' > "$dir/responses/8.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
@@ -491,15 +533,14 @@ test_send_text_submit_detects_swallowed_enter() {
   local dir fb out
   dir="$TMP_ROOT/submit-swallow"; mkdir -p "$dir/responses"
   zellij_pane_response "$dir" 1 7 3
-  zellij_pane_response "$dir" 2 7 3
-  zellij_pane_response "$dir" 4 7 3
-  zellij_pane_response "$dir" 6 7 3
-  zellij_pane_response "$dir" 8 7 3
-  zellij_pane_response "$dir" 10 7 3
-  zellij_pane_response "$dir" 12 7 3
-  printf '%s' $'❯ hello captain' > "$dir/responses/5.out"
-  printf '%s' $'❯ hello captain' > "$dir/responses/9.out"
-  printf '%s' $'❯ hello captain' > "$dir/responses/13.out"
+  zellij_pane_response "$dir" 3 7 3
+  zellij_pane_response "$dir" 5 7 3
+  zellij_pane_response "$dir" 7 7 3
+  zellij_pane_response "$dir" 9 7 3
+  zellij_pane_response "$dir" 11 7 3
+  printf '%s' $'❯ hello captain' > "$dir/responses/4.out"
+  printf '%s' $'❯ hello captain' > "$dir/responses/8.out"
+  printf '%s' $'❯ hello captain' > "$dir/responses/12.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
@@ -510,15 +551,29 @@ test_send_text_submit_detects_swallowed_enter() {
   pass "fm_backend_zellij_send_text_submit: reports 'pending' when the pane never changes after retried Enters (swallowed)"
 }
 
-test_send_text_submit_unknown_when_session_absent() {
+test_send_text_submit_send_failed_when_session_absent() {
   local dir fb out
   dir="$TMP_ROOT/submit-no-session"; mkdir -p "$dir/responses"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="" \
     bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_text_submit firstmate:7 "x" 2 0.01 0.01' "$ROOT" )
-  [ "$out" = unknown ] || fail "send_text_submit should report unknown when the session does not exist, got '$out'"
-  pass "fm_backend_zellij_send_text_submit: reports 'unknown' when the target session is not active"
+  [ "$out" = send-failed ] || fail "send_text_submit should report send-failed when the session does not exist, got '$out'"
+  pass "fm_backend_zellij_send_text_submit: reports 'send-failed' when the target session is not active"
+}
+
+test_send_text_submit_send_failed_when_pane_absent() {
+  local dir fb out
+  dir="$TMP_ROOT/submit-no-pane"; mkdir -p "$dir/responses"
+  printf '[]\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_text_submit firstmate:7 "x" 2 0.01 0.01' "$ROOT" )
+  [ "$out" = send-failed ] || fail "send_text_submit should report send-failed when the pane does not exist, got '$out'"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''paste' \
+    "send_text_submit should not paste text after pane readiness fails"
+  pass "fm_backend_zellij_send_text_submit: reports 'send-failed' when the target pane is absent"
 }
 
 # --- fm-*.sh script routing via explicit backend-tagged meta ------------------
@@ -588,12 +643,15 @@ test_capture_fails_when_pane_absent
 test_capture_fails_when_session_absent
 test_send_key_normalizes_and_targets_pane
 test_send_literal_uses_paste_separator_for_option_shaped_text
-test_current_path_probes_with_pwd_and_scrapes_last_path_line
+test_current_path_probes_with_marker_and_ignores_prompt_paths
 test_current_path_ignores_tilde_prefixed_banner_lines
 test_kill_resolves_tab_and_closes_by_id
 test_kill_falls_back_to_close_pane_when_tab_lookup_empty
+test_kill_closes_recorded_tab_when_pane_already_gone
 test_kill_is_noop_when_session_absent
+test_teardown_passes_recorded_tab_id_to_zellij_kill
 test_send_text_submit_detects_landed_send
 test_send_text_submit_detects_swallowed_enter
-test_send_text_submit_unknown_when_session_absent
+test_send_text_submit_send_failed_when_session_absent
+test_send_text_submit_send_failed_when_pane_absent
 test_scripts_route_explicit_target_through_meta_backend

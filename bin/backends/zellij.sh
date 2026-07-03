@@ -60,12 +60,14 @@
 #     session (prints the live session list to stdout, an error to stderr) or
 #     a nonexistent pane id in a live session (prints nothing at all, to
 #     neither stream). The exit code can NEVER be trusted to detect a bad
-#     target. Mitigated: every op below verifies session liveness first
+#     target. Mitigated: send/capture/cwd ops verify session liveness first
 #     (fm_backend_zellij_session_exists, a passive list-sessions query, never
-#     auto-creating) and verifies the specific pane still appears in
-#     list-panes JSON before use. Output-SHAPE validation (a bare integer tab
-#     id, JSON that parses) rejects the "session not found" text fallback. A
-#     pane can still die between the preflight check and the operation call;
+#     auto-creating) and verify the specific pane still appears in list-panes
+#     JSON before use. Kill verifies the session and closes the recorded tab id
+#     when teardown supplies one, so an already-gone pane cannot leave an empty
+#     ghost tab behind. Output-SHAPE validation (a bare integer tab id, JSON
+#     that parses) rejects the "session not found" text fallback. A pane can
+#     still die between the preflight check and the operation call;
 #     docs/zellij-backend.md records that residual race.
 #   - `zellij list-tabs`/`new-tab` does NOT enforce unique tab names (same as
 #     herdr's tabs, unlike tmux's own window-name uniqueness), so the
@@ -299,23 +301,21 @@ fm_backend_zellij_target_ready() {  # <target>
 # a `pwd` typed into it prints the correct live path on screen. Zellij's CLI
 # exposes no per-pane pid and no live-process cwd field to read instead
 # (unlike herdr's `foreground_cwd`), so passive JSON polling cannot solve
-# this. Active probe instead: send a literal `pwd` into the pane (atomically
-# submitted, mirroring send_text_line), briefly settle, then capture and take
-# the LAST line that looks like an absolute path (`/...`) - the plain,
-# single-line output `pwd` itself produces. Treehouse's own banner text uses
-# `~`-prefixed paths, never a bare leading `/`, so it cannot collide with this
-# scan. Scoped to fm-spawn.sh's own worktree-discovery poll loop (the only
-# caller of this op), where injecting a harmless extra `pwd` before the
-# harness ever launches is an acceptable trade for a reliable answer.
+# this. Active probe instead: print the pane's `$PWD` with a unique marker
+# (atomically submitted, mirroring send_text_line), briefly settle, then capture
+# and read only that marker line. Scoped to fm-spawn.sh's own worktree-discovery
+# poll loop (the only caller of this op), where injecting a harmless extra
+# command before the harness ever launches is an acceptable trade for a reliable
+# answer.
 fm_backend_zellij_current_path() {  # <target>
-  local target=$1 out line last=""
+  local target=$1 out line marker="__FM_ZELLIJ_CWD__:" last=""
   fm_backend_zellij_target_ready "$target" || return 0
-  fm_backend_zellij_send_text_line "$target" pwd || return 0
+  fm_backend_zellij_send_text_line "$target" "printf '${marker}%s\n' \"\$PWD\"" || return 0
   sleep 0.3
   out=$(fm_backend_zellij_capture "$target" 15) || return 0
   while IFS= read -r line; do
     case "$line" in
-      /*) last=$line ;;
+      "$marker"/*) last=${line#"$marker"} ;;
     esac
   done <<EOF
 $out
@@ -400,7 +400,6 @@ fm_backend_zellij_capture() {  # <target> <lines>
 # vocabulary fm-send.sh already branches on for tmux and herdr.
 fm_backend_zellij_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 typed after i=0
-  fm_backend_zellij_target_ready "$target" || { printf 'unknown'; return 0; }
   fm_backend_zellij_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
   sleep "$settle"
   typed=$(fm_backend_zellij_capture "$target" 6) || { printf 'unknown'; return 0; }
@@ -423,14 +422,19 @@ fm_backend_zellij_send_text_submit() {  # <target> <text> <retries> <enter-sleep
 # empty tab survives in list-tabs); `close-tab-by-id` on a live tab DOES
 # cleanly remove both the pane and the tab in one call, verified to need no
 # separate pane-close first. The owning tab id is looked up fresh from the
-# pane id (never trusted from a possibly-stale caller) via
-# fm_backend_zellij_tab_for_pane; if that lookup comes up empty (the pane is
-# already gone, or on some unanticipated variant), fall back to a direct
-# close-pane attempt so kill is never a hard no-op.
-fm_backend_zellij_kill() {  # <target>
-  fm_backend_zellij_target_ready "$1" || return 0
-  local tab_id
+# pane id when possible via fm_backend_zellij_tab_for_pane; if that lookup comes
+# up empty because the pane is already gone, teardown passes the recorded tab id
+# as a fallback. Without a tab id, kill falls back to a direct close-pane attempt
+# so it is never a hard no-op.
+fm_backend_zellij_kill() {  # <target> [tab_id]
+  fm_backend_zellij_parse_target "$1" || return 0
+  fm_backend_zellij_session_exists "$FM_BACKEND_ZELLIJ_SESSION" || return 0
+  local tab_id fallback_tab_id=${2:-}
   tab_id=$(fm_backend_zellij_tab_for_pane "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE" 2>/dev/null)
+  case "$fallback_tab_id" in
+    ''|*[!0-9]*) ;;
+    *) [ -n "$tab_id" ] || tab_id=$fallback_tab_id ;;
+  esac
   if [ -n "$tab_id" ]; then
     fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action close-tab-by-id "$tab_id" >/dev/null 2>&1 || true
   else

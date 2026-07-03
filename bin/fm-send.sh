@@ -107,7 +107,7 @@ else
       exit 1
       ;;
     send-failed)
-      echo "error: text not sent to $T (tmux send-keys failed)" >&2
+      echo "error: text not sent to $T ($TARGET_BACKEND send failed)" >&2
       exit 1
       ;;
   esac
