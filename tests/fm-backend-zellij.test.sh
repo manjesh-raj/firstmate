@@ -317,17 +317,17 @@ test_send_key_normalizes_and_targets_pane() {
   pass "fm_backend_zellij_send_key: normalizes the key (Escape -> Esc) and targets the explicit pane id"
 }
 
-test_send_literal_uses_paste_not_write_chars() {
+test_send_literal_uses_paste_separator_for_option_shaped_text() {
   local dir fb
   dir="$TMP_ROOT/sendliteral"; mkdir -p "$dir/responses"
   fb=$(make_zellij_fakebin "$dir")
   PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
-    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_literal firstmate:7 "hello captain"' "$ROOT"
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_literal firstmate:7 "--help"' "$ROOT"
   expect_code 0 $? "send_literal should succeed"
-  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''hello captain' \
-    "send_literal did not call paste (bracketed paste, report's recommendation) with the explicit pane id"
-  pass "fm_backend_zellij_send_literal: calls paste (not write-chars) with the explicit pane id"
+  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--'$'\x1f''--help' \
+    "send_literal did not call paste with a -- separator before the literal payload"
+  pass "fm_backend_zellij_send_literal: calls paste with an explicit pane id and a -- separator"
 }
 
 test_current_path_probes_with_pwd_and_scrapes_last_path_line() {
@@ -348,7 +348,7 @@ test_current_path_probes_with_pwd_and_scrapes_last_path_line() {
     FM_ZELLIJ_SESSION_LIST="firstmate" \
     bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_current_path firstmate:7' "$ROOT" )
   [ "$out" = "/Users/kunchen/.treehouse/fake-worktree" ] || fail "current_path should scrape the last absolute-path line from the pwd probe, got '$out'"
-  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''pwd' "current_path did not send a pwd probe via paste"
+  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--'$'\x1f''pwd' "current_path did not send a pwd probe via paste"
   assert_contains "$(cat "$dir/log")" $'\x1f''send-keys'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''Enter' "current_path did not submit the pwd probe with Enter"
   assert_contains "$(cat "$dir/log")" $'\x1f''dump-screen'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--full' "current_path did not capture the pane after probing"
   pass "fm_backend_zellij_current_path: actively probes with pwd and scrapes the last absolute-path line (pane_cwd cannot track a subshell)"
@@ -425,7 +425,7 @@ test_send_text_submit_detects_landed_send() {
     FM_ZELLIJ_SESSION_LIST="firstmate" \
     bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_send_text_submit firstmate:7 "hello captain" 3 0.01 0.01' "$ROOT" )
   [ "$out" = empty ] || fail "send_text_submit should report empty (submitted) once the pane visibly changes, got '$out'"
-  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''hello captain' "send_text_submit did not type the literal text first"
+  assert_contains "$(cat "$dir/log")" $'\x1f''paste'$'\x1f''--pane-id'$'\x1f''7'$'\x1f''--'$'\x1f''hello captain' "send_text_submit did not type the literal text first"
   pass "fm_backend_zellij_send_text_submit: reports 'empty' once the pane content changes after Enter (submitted)"
 }
 
@@ -513,7 +513,7 @@ test_create_task_no_restore_when_new_tab_was_already_active
 test_capture_calls_dump_screen_full_and_trims
 test_capture_fails_when_session_absent
 test_send_key_normalizes_and_targets_pane
-test_send_literal_uses_paste_not_write_chars
+test_send_literal_uses_paste_separator_for_option_shaped_text
 test_current_path_probes_with_pwd_and_scrapes_last_path_line
 test_current_path_ignores_tilde_prefixed_banner_lines
 test_kill_resolves_tab_and_closes_by_id

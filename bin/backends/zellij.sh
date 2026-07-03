@@ -326,7 +326,7 @@ EOF
 # recommendation over write-chars, for popup-safety parity with tmux/herdr).
 fm_backend_zellij_send_literal() {  # <target> <text>
   fm_backend_zellij_target_ready "$1" || return 1
-  fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action paste --pane-id "$FM_BACKEND_ZELLIJ_PANE" "$2" >/dev/null 2>&1
+  fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action paste --pane-id "$FM_BACKEND_ZELLIJ_PANE" -- "$2" >/dev/null 2>&1
 }
 
 # fm_backend_zellij_normalize_key: map firstmate's key vocabulary (Enter,
