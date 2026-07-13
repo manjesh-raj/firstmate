@@ -5,6 +5,7 @@ data/
 .lavish/
 .DS_Store
 .env
+.venv/
 config/crew-harness
 config/crew-dispatch.json
 config/secondmate-harness
