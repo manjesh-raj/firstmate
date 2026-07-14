@@ -25,16 +25,18 @@
 # remainder is the whole pane id - fm_backend_herdr_parse_target splits on the
 # first colon only). This is the value stored in a herdr task's meta window=
 # field and is what fm_backend_resolve_selector already returns unchanged for
-# both the fm-<id> and explicit backend-target forms (that function has no
-# herdr-specific logic; it just returns meta's window= verbatim).
+# exact task-id, legacy fm-<id>, and explicit backend-target forms (that
+# function has no herdr-specific logic; it just returns meta's window=
+# verbatim).
 #
 # Recovery/orphan discovery (ids may not deterministically match live state
 # after a server restart in a differently-configured session; see the
 # verification doc) uses LABEL matching (fm-<id> tab labels), never trusts a
 # stored pane id blindly: fm_backend_herdr_list_live.
 #
-# Requires: herdr (CLI + socket), jq (JSON parsing). Both are gated behind
-# selecting this backend; bin/fm-bootstrap.sh's core tool list is unaffected.
+# Requires: herdr (CLI + socket), jq (JSON parsing). Bootstrap detects these
+# through fm_backend_required_tools only when herdr is the resolved backend;
+# this adapter also gates them again before spawning.
 
 # FM_HOME fallback: every real caller (fm-spawn.sh, fm-peek.sh, fm-send.sh,
 # fm-teardown.sh, fm-watch.sh, fm-crew-state.sh) already sets FM_HOME as a
@@ -48,7 +50,35 @@ FM_BACKEND_HERDR_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_BACKEND_HERDR_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
+# Shared composer-content classifier (empty|pending|unknown, and the fleet-wide
+# dead-shell-vs-agent-composer rule). Owned by bin/fm-composer-lib.sh, reused by
+# every backend so the decision cannot drift.
+# shellcheck source=bin/fm-composer-lib.sh
+. "$FM_BACKEND_HERDR_ROOT/bin/fm-composer-lib.sh"
+
+# Shared, backend-neutral normalized-transition shape and the single-owner
+# status->action policy table (bin/fm-transition-lib.sh). This adapter's event
+# subscriber (fm_backend_herdr_wait_transition) normalizes every
+# pane.agent_status_changed edge through fm_transition_record and routes it
+# through fm_transition_policy - it never re-encodes the mapping.
+# shellcheck source=bin/fm-transition-lib.sh
+. "$FM_BACKEND_HERDR_ROOT/bin/fm-transition-lib.sh"
+
 FM_BACKEND_HERDR_MIN_PROTOCOL=14
+# events.subscribe (the native pane.agent_status_changed push stream) and its
+# subscription_event schema first shipped at protocol 16 (verified: herdr
+# 0.7.3). Below this, or with the events surface absent from `herdr api schema`,
+# the event fast-path fails closed to the watcher's poll loop
+# (fm_backend_herdr_events_capable). Distinct from FM_BACKEND_HERDR_MIN_PROTOCOL
+# (14): the adapter's spawn/capture/send primitives work on 14, only the push
+# subscriber needs 16.
+FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL=16
+# Per-pane escalation dedupe marker prefix, under the state dir. One marker per
+# window (keyed like the watcher's own .stale-<key>): set when a ->blocked edge
+# is enqueued, cleared on any working edge, so exactly one wake fires per
+# ->blocked edge and a reconnect level-reconcile never re-delivers a still-
+# blocked pane. Mirrors bin/fm-watch.sh's .stale-<key> naming.
+FM_BACKEND_HERDR_ESCALATED_PREFIX=".herdr-escalated-"
 # .fm-secondmate-home is written by bin/fm-home-seed.sh (AGENTS.md section 6)
 # at a seeded secondmate home's root, containing exactly that secondmate's id.
 # The primary firstmate home never carries this marker.
@@ -102,7 +132,7 @@ fm_backend_herdr_cli() {  # <session> <herdr-subcommand-and-args...>
 
 # fm_backend_herdr_tool_check: refuse loudly if herdr or jq is missing.
 fm_backend_herdr_tool_check() {
-  command -v herdr >/dev/null 2>&1 || { echo "error: backend=herdr selected but the 'herdr' CLI is not installed (https://herdr.dev)" >&2; return 1; }
+  command -v herdr >/dev/null 2>&1 || { echo "error: backend=herdr selected but the 'herdr' CLI is not installed (https://herdr.dev) (dual-licensed AGPL-3.0-or-later/commercial)" >&2; return 1; }
   command -v jq >/dev/null 2>&1 || { echo "error: backend=herdr selected but 'jq' is not installed (required to parse herdr's JSON output)" >&2; return 1; }
   return 0
 }
@@ -321,10 +351,135 @@ fm_backend_herdr_container_ensure() {  # <cwd-for-a-fresh-workspace>
   printf '%s:%s\t%s' "$session" "$FM_BACKEND_HERDR_WS_ID" "$FM_BACKEND_HERDR_WS_SEEDED_TAB_ID"
 }
 
+# fm_backend_herdr_pane_agent_state: classify <pane_id> in <session> as one of
+# dead|no-agent|live|unknown, purely from the JSON body of two read-only
+# calls - never from process exit status, since a business-logic "not found"
+# response is a normal, expected outcome here, not a call failure (real herdr
+# 0.7.1 exits 1 for it; the canned-response test fakes exit 0; parsing only
+# the JSON keeps this function correct against either).
+#
+#   dead     - `pane get` responds with error code pane_not_found: the pane
+#              itself is gone (closed, or its process died and herdr already
+#              reaped it - verified empirically: killing a pane's shell pid
+#              on a live server makes herdr immediately drop both the pane
+#              and its tab from `pane get`/`tab list`).
+#   no-agent - `pane get` succeeds (the pane structurally exists) but `agent
+#              get` responds with error code agent_not_found: nothing is
+#              registered in it - exactly what a herdr session-layout restore
+#              produces (verified empirically: `session stop` + fresh `herdr
+#              server` restart leaves the pane alive, agent_status "unknown",
+#              agent get -> agent_not_found - docs/herdr-backend.md "ID
+#              stability across a server restart"), and what a future
+#              `resume_agents_on_restore = false` restore would produce too
+#              (a plain shell, never an agent).
+#   live     - `agent get` succeeds and reports a real agent_status (working,
+#              idle, done, or blocked - any registered value). An idle or
+#              blocked agent is still a genuine, still-registered agent, not
+#              a restored husk, so it is never a close-and-replace candidate.
+#   unknown  - anything else: an unparseable/unexpected response from either
+#              call, or a `pane get` success whose own echoed pane_id does not
+#              round-trip (guards against misreading a herdr response shape
+#              change as "the pane exists"). The caller must fail safe toward
+#              refusal here, never toward closing - this is the conservative
+#              backstop the husk check depends on.
+fm_backend_herdr_pane_agent_state() {  # <session> <pane_id>
+  local session=$1 pane_id=$2 out code pid status
+  # 2>&1, not 2>/dev/null: verified empirically that real herdr 0.7.1 writes
+  # an error response's JSON body to STDERR (success bodies go to stdout), so
+  # discarding stderr here would blind this function to exactly the
+  # error.code values (pane_not_found, agent_not_found) it exists to read -
+  # every OTHER call site in this file discards stderr safely only because
+  # its caller collapses both the error and the not-an-error paths to the
+  # same final answer, which this function's dead/no-agent/live/unknown
+  # distinction cannot afford to do.
+  out=$(fm_backend_herdr_cli "$session" pane get "$pane_id" 2>&1)
+  code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+  if [ -n "$code" ]; then
+    [ "$code" = "pane_not_found" ] && printf 'dead' || printf 'unknown'
+    return 0
+  fi
+  pid=$(printf '%s' "$out" | jq -r '.result.pane.pane_id // empty' 2>/dev/null)
+  if [ "$pid" != "$pane_id" ]; then
+    printf 'unknown'
+    return 0
+  fi
+  out=$(fm_backend_herdr_cli "$session" agent get "$pane_id" 2>&1)
+  code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+  if [ -n "$code" ]; then
+    [ "$code" = "agent_not_found" ] && printf 'no-agent' || printf 'unknown'
+    return 0
+  fi
+  status=$(printf '%s' "$out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+  case "$status" in
+    working|idle|done|blocked) printf 'live' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# fm_backend_herdr_tab_is_husk: true (0) only for the two conservative husk
+# states (dead, no-agent) fm_backend_herdr_pane_agent_state can positively
+# confirm; live and unknown both refuse (1), so an inconclusive read never
+# licenses closing anything. Restored-layout recovery depends on this
+# fail-safe-toward-refusal behavior.
+fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
+  case "$(fm_backend_herdr_pane_agent_state "$1" "$2")" in
+    dead|no-agent) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# fm_backend_herdr_agent_alive: CONFIDENT liveness of a live harness-agent
+# PROCESS under <target> ("<session>:<pane_id>"), for the same
+# session-start secondmate-liveness sweep fm_backend_tmux_agent_alive serves
+# (bin/fm-bootstrap.sh; docs/herdr-backend.md "Agent liveness probe reuses the
+# husk classifier"). Reuses fm_backend_herdr_pane_agent_state, the
+# already-verified husk classifier ("Respawn idempotency" above): `dead`
+# (structurally gone pane) and `no-agent` (a restored, agent-less bare shell
+# - EXACTLY the shape a dead secondmate leaves behind) both collapse to
+# `dead`; `live` (a real registered agent_status, including idle/blocked)
+# maps to `alive`; `unknown` stays `unknown` - fail-safe toward refusal,
+# exactly like the husk check itself. Callers must never treat `unknown` as a
+# confirmed-dead signal.
+fm_backend_herdr_agent_alive() {  # <target>
+  local target=$1
+  fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  case "$(fm_backend_herdr_pane_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" in
+    dead|no-agent) printf 'dead' ;;
+    live) printf 'alive' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 # fm_backend_herdr_create_task: create the task's tab (one pane) in
-# <container> ("session:workspace_id"), refusing an existing <label>. Herdr
-# does NOT enforce label uniqueness itself (verified: two tabs can share a
-# label), so the duplicate check is ours, mirroring tmux's manual check.
+# <container> ("session:workspace_id"). Herdr does NOT enforce label
+# uniqueness itself (verified: two tabs can share a label), so the duplicate
+# check is ours, mirroring tmux's manual check.
+#
+# A same-labeled tab already existing no longer means an automatic refusal:
+# herdr persists and restores its whole session layout (workspaces/tabs/
+# panes) across a server restart, including a reboot, and a restored fm-<id>
+# task tab comes back a HUSK - a dead pane, or (today, and unconditionally
+# once a future `resume_agents_on_restore = false` config ships) a plain
+# agent-less shell sitting in the saved cwd, never the crewmate that used to
+# be there. Before this fix, every fleet respawn after such a restart needed
+# the operator to manually close each husk pane first before firstmate could
+# spawn into it again. fm_backend_herdr_tab_is_husk classifies the existing
+# tab's pane conservatively (dead or no-agent only; anything live or
+# ambiguous refuses exactly as before) and, when it is a confirmed husk,
+# this function CLOSES AND REPLACES it instead of refusing.
+#
+# Ordering is deliberate: the REPLACEMENT tab is created FIRST, and the husk
+# is closed only AFTER that succeeds - never the reverse. Closing a
+# workspace's LAST remaining tab deletes the whole workspace on real herdr
+# (docs/herdr-backend.md "Workspace lifecycle"), and a session-restore husk
+# can legitimately be that workspace's only tab (e.g. its own seeded default
+# tab was already pruned, long before the restart, by a prior real task tab
+# existing alongside it). Herdr's lack of label-uniqueness enforcement is
+# exactly what makes this safe: the new and the husk tab can briefly share
+# the same label with no error, so the workspace never drops to zero tabs.
+# This mirrors fm_backend_herdr_workspace_prune_seeded_default_tab's own
+# create-before-close safety argument.
+#
 # --no-focus: verified tab create never focuses by default regardless of
 # sibling tabs, so this is defense in depth rather than a behavior change.
 # <seeded_default_tab_id> (4th arg, may be empty) is exactly the value
@@ -339,14 +494,27 @@ fm_backend_herdr_container_ensure() {  # <cwd-for-a-fresh-workspace>
 # 4th arg, so this function never even queries for a prune candidate in that
 # case. Echoes "<tab_id> <pane_id>" on success.
 fm_backend_herdr_create_task() {  # <container> <label> <cwd> <seeded_default_tab_id>
-  local container=$1 label=$2 cwd=$3 seeded_tab_id=${4:-} session wsid list dup out tab_id pane_id
+  local container=$1 label=$2 cwd=$3 seeded_tab_id=${4:-} session wsid list dup_tabs dup dup_pane dup_tab_ids out tab_id pane_id remaining_dup_tabs
   session=${container%%:*}
   wsid=${container#*:}
   list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 1
-  dup=$(printf '%s' "$list" | jq -r --arg want "$label" '.result.tabs[]? | select(.label == $want) | .tab_id' 2>/dev/null | head -1)
-  if [ -n "$dup" ]; then
-    echo "error: herdr tab '$label' already exists in workspace $wsid (session $session)" >&2
+  dup_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" 'if (.result.tabs | type) == "array" then .result.tabs[] | select(.label == $want) | .tab_id else error("missing result.tabs") end' 2>/dev/null) || {
+    echo "error: could not parse herdr tab list output for workspace $wsid (session $session)" >&2
     return 1
+  }
+  dup_tab_ids=""
+  if [ -n "$dup_tabs" ]; then
+    while IFS= read -r dup; do
+      [ -n "$dup" ] || continue
+      dup_pane=$(fm_backend_herdr_pane_for_tab "$session" "$wsid" "$dup")
+      if [ -z "$dup_pane" ] || ! fm_backend_herdr_tab_is_husk "$session" "$dup_pane"; then
+        echo "error: herdr tab '$label' already exists in workspace $wsid (session $session)" >&2
+        return 1
+      fi
+      dup_tab_ids="${dup_tab_ids}${dup}"$'\n'
+    done <<EOF
+$dup_tabs
+EOF
   fi
   out=$(fm_backend_herdr_cli "$session" tab create --workspace "$wsid" --cwd "$cwd" --label "$label" --no-focus 2>/dev/null) || return 1
   tab_id=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
@@ -356,6 +524,29 @@ fm_backend_herdr_create_task() {  # <container> <label> <cwd> <seeded_default_ta
     return 1
   fi
   [ -z "$seeded_tab_id" ] || fm_backend_herdr_workspace_prune_seeded_default_tab "$session" "$wsid" "$seeded_tab_id"
+  if [ -n "$dup_tab_ids" ]; then
+    while IFS= read -r dup; do
+      [ -n "$dup" ] || continue
+      fm_backend_herdr_cli "$session" tab close "$dup" >/dev/null 2>&1 || true
+    done <<EOF
+$dup_tab_ids
+EOF
+    list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
+      echo "error: could not verify herdr husk removal for tab '$label' in workspace $wsid (session $session)" >&2
+      return 1
+    }
+    if ! printf '%s' "$list" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
+      echo "error: could not parse herdr tab list output for workspace $wsid (session $session)" >&2
+      return 1
+    fi
+    remaining_dup_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" --arg replacement "$tab_id" \
+      '.result.tabs[]? | select(.label == $want and .tab_id != $replacement) | .tab_id' 2>/dev/null)
+    remaining_dup_tabs=${remaining_dup_tabs//$'\n'/ }
+    if [ -n "$remaining_dup_tabs" ]; then
+      echo "error: failed to remove preexisting herdr tab(s) $remaining_dup_tabs for label '$label' in workspace $wsid (session $session)" >&2
+      return 1
+    fi
+  fi
   printf '%s %s' "$tab_id" "$pane_id"
 }
 
@@ -442,10 +633,10 @@ fm_backend_herdr_send_key() {  # <target> <key>
 # is smaller than the pane's current viewport height (observed threshold ~23
 # rows for a default-sized pane), instead of clamping to the last N lines - it
 # does not merely ignore the bound, it drops the read entirely. This silently
-# broke exactly the small bounded reads this adapter relies on most (a 6-line
-# composer-verification read in send_text_submit). Workaround: always request
-# a generous fetch far above any realistic viewport height, then trim to the
-# caller's requested bound ourselves with `tail`.
+# broke exactly the small bounded reads this adapter relies on most (including
+# the composer-state guard/fallback reads around submit and injection). Workaround:
+# always request a generous fetch far above any realistic viewport height, then
+# trim to the caller's requested bound ourselves with `tail`.
 fm_backend_herdr_capture() {  # <target> <lines>
   fm_backend_herdr_target_ready "$1" || return 1
   local lines=${2:-200} fetch out
@@ -456,36 +647,229 @@ fm_backend_herdr_capture() {  # <target> <lines>
   printf '%s' "$out" | tail -n "$lines"
 }
 
+fm_backend_herdr_capture_ansi() {  # <target> <lines>
+  fm_backend_herdr_target_ready "$1" || return 1
+  local lines=${2:-200} fetch out
+  case "$lines" in ''|*[!0-9]*) lines=200 ;; esac
+  fetch=$lines
+  case "$fetch" in ''|*[!0-9]*) fetch=200 ;; *) [ "$fetch" -ge 200 ] || fetch=200 ;; esac
+  out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane read "$FM_BACKEND_HERDR_PANE" --source recent --lines "$fetch" --format ansi 2>/dev/null) || return 1
+  printf '%s' "$out" | tail -n "$lines"
+}
+
+# Thin adapter over the shared plain-text stripper (bin/fm-composer-lib.sh),
+# used only for STRUCTURAL row/shape detection where ghost text must be kept so
+# the box border or bare prompt glyph is still visible. Content extraction uses
+# the shared fm_composer_strip_ghost instead.
+fm_backend_herdr_strip_ansi() {  # <text>
+  printf '%s' "$1" | fm_composer_strip_ansi
+}
+
+# fm_backend_herdr_composer_state: classify the composer's own row as
+# empty|pending|unknown, scanning a generous tail-window capture of <target>.
+# herdr's CLI exposes no cursor-row primitive (unlike tmux's #{cursor_y}), so
+# this locates the composer row structurally, recognizing TWO row shapes and
+# keeping whichever match comes LAST (scanning forward), so a shape earlier in
+# scrollback/a popup can never outrank the real (bottom-anchored) composer row:
+#
+#   bordered - a boxed composer (verified grok 0.2.82): the row's TRIMMED
+#              content both STARTS and ENDS with the same border glyph (│, ┃,
+#              or a plain ASCII |). The box's own top/bottom rows use rounded
+#              corners (╭─…─╮ / ╰─…─╯), which never match; popup item rows and
+#              horizontal separator rows carry no border glyph at all; the
+#              footer help line ("Enter:send │ … │ …") uses │ only as an
+#              INTERIOR separator and does not start with one, so it never
+#              matches either.
+#   bare     - an UNBORDERED composer (verified real claude 2.x and codex
+#              0.142.x, both under herdr 0.7.1, docs/herdr-backend.md
+#              "Incident (2026-07-07)"): the row's TRIMMED content starts with
+#              one of the verified agent-specific prompt glyphs but carries no
+#              closing border at all - claude's own live input row is a bare
+#              "❯ …" with no surrounding │, and codex's is a bare "› …". Both
+#              harnesses ALSO render bordered decorative boxes elsewhere (a
+#              startup welcome banner, an update-available notice) that
+#              satisfy the bordered shape above; requiring a match on EITHER
+#              shape and keeping the last (bottom-most) one is what keeps the
+#              live composer winning over a stale decorative box still sitting
+#              in the same capture window - a bordered box is only ever
+#              followed later on screen by the actual live composer, never the
+#              reverse, in every harness observed so far. The bare shape is
+#              deliberately narrower than the bordered content classifier so a
+#              no-agent shell fallback prompt (`>`, `$`, `%`, or `#`) falls
+#              through to `unknown` instead of being misread as delivered.
+#
+#   empty   - blank, a bare prompt glyph, known ghost/placeholder text
+#             ("Type a message...", verified grok 0.2.82's empty-composer
+#             placeholder), or only de-emphasised ANSI ghost/placeholder text
+#             recognized by the shared fm_composer_strip_ghost extractor
+#             (dim/faint or dark-TRUECOLOR foreground). Safe to treat as
+#             submitted.
+#   pending - real, unsubmitted text sits in the composer. This deliberately
+#             also covers a slash-command popup that just closed but only
+#             auto-completed or filled an argument-hint placeholder into the
+#             composer (e.g. "/compact" -> "/compact compaction
+#             instructions", verified live against real grok 0.2.82) - that
+#             first Enter is a SELECTION, not a submission.
+#   unknown - the pane could not be read, or no composer row (of either shape)
+#             was found in the captured window.
+#
+# Ghost/placeholder note: herdr's ANSI pane read preserves the harness's own
+# de-emphasis styling, and the classifier extracts real typed content with the
+# shared fm_composer_strip_ghost (bin/fm-composer-lib.sh), which drops dim/faint
+# runs (claude's rotating prompt suggestion, codex's idle suggestion after the
+# bare `›` prompt) AND dark/muted truecolor foreground runs (grok's placeholder),
+# while keeping non-de-emphasised real typed input. This is the same owner the
+# tmux adapter routes through, so the two backends cannot drift (task
+# afk-herdr-false-pending); it superseded a herdr-only faint byte-pattern check
+# that recognized only codex's bold-wrapped bare prompt and missed claude's own
+# dim ghost - the overnight away-mode injection wedge on the primary claude pane.
+FM_BACKEND_HERDR_COMPOSER_LINES=${FM_BACKEND_HERDR_COMPOSER_LINES:-20}
+# Known ghost/placeholder composer text. Extend this if another
+# herdr-verified harness needs its own idle placeholder recognized.
+FM_BACKEND_HERDR_IDLE_RE=${FM_BACKEND_HERDR_IDLE_RE:-'^Type a message\.\.\.$'}
+# Known bare (unbordered) prompt glyphs a composer row may start with: ❯
+# (claude) and › (codex) only. Generic shell-style glyphs > $ % # are still
+# recognized after a bordered composer row has already been structurally found.
+FM_BACKEND_HERDR_BARE_PROMPT_RE=${FM_BACKEND_HERDR_BARE_PROMPT_RE:-'^[❯›]'}
+
+fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
+  local target=$1 cap line trimmed found=0 shape="" raw_match="" bordered=0 stripped
+  cap=$(fm_backend_herdr_capture_ansi "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES" 2>/dev/null \
+    || fm_backend_herdr_capture "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES") || { printf 'unknown'; return 0; }
+  # Structural scan: locate the bottom-most composer row and remember its RAW
+  # (styled) bytes. Shape detection runs on the plain row (fm_backend_herdr_strip_ansi
+  # keeps ghost text so the border/prompt glyph is still visible); the raw row is
+  # kept for ANSI-aware content extraction after the scan.
+  while IFS= read -r line; do
+    trimmed=$(fm_backend_herdr_strip_ansi "$line")
+    trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [ -n "$trimmed" ] || continue
+    case "$trimmed" in
+      '│'*'│'|'┃'*'┃'|'|'*'|')
+        shape=bordered
+        raw_match=$line
+        found=1
+        ;;
+      *)
+        if printf '%s' "$trimmed" | grep -qE "$FM_BACKEND_HERDR_BARE_PROMPT_RE"; then
+          shape=bare
+          raw_match=$line
+          found=1
+        fi
+        ;;
+    esac
+  done < <(printf '%s\n' "$cap")
+  [ "$found" -eq 1 ] || { printf 'unknown'; return 0; }
+  # Content: extract the real typed text from the raw row with the shared,
+  # fleet-wide ghost stripper (bin/fm-composer-lib.sh), which drops dim/faint AND
+  # dark-truecolor ghost/placeholder runs. This replaces the former herdr-only
+  # faint byte-pattern check (which recognized only Codex's bold-wrapped bare
+  # prompt and missed claude's own dim prompt-suggestion ghost - the overnight
+  # afk-herdr-false-pending wedge) and, in a dark theme, drops the composer's own
+  # dark box border too, which is why the bordered flag was read from the plain
+  # shape above, not from this ghost-stripped content.
+  stripped=$(printf '%s\n' "$raw_match" | fm_composer_strip_ghost)
+  stripped="${stripped#"${stripped%%[![:space:]]*}"}"
+  stripped="${stripped%"${stripped##*[![:space:]]}"}"
+  if [ "$shape" = bordered ]; then
+    bordered=1
+    stripped=${stripped//│/}
+    stripped=${stripped//┃/}
+    stripped=${stripped//|/}
+    stripped="${stripped#"${stripped%%[![:space:]]*}"}"
+    stripped="${stripped%"${stripped##*[![:space:]]}"}"
+  fi
+  # Delegate the empty/pending/unknown decision to the shared owner. The bare
+  # shape only ever starts with an AGENT glyph (FM_BACKEND_HERDR_BARE_PROMPT_RE
+  # is '^[❯›]'), so a bare shell prompt never reaches here - it stays 'unknown'
+  # via the no-composer-row path above, exactly as before.
+  fm_composer_classify_content "$bordered" "$stripped" "$FM_BACKEND_HERDR_IDLE_RE"
+}
+
 # fm_backend_herdr_send_text_submit: type <text> into <target> once (raw,
 # unsubmitted, via send_literal), then submit with a named Enter key, retried
-# (Enter only, never retyped) until the pane visibly changes. Verified hazard
-# (herdr-verification-p2.md "slash/$ autocomplete popup"): a `/`- or
-# `$`-prefixed send opens a completion popup within ~0.1s, exactly like tmux's
-# claude/codex popups, so the caller's <settle> before the first Enter matters
-# here the same way it does for tmux.
+# (Enter only, never retyped) until herdr's NATIVE agent-state (agent get)
+# confirms a real turn started. Verified hazard (herdr-verification-p2.md
+# "slash/$ autocomplete popup"): a `/`- or `$`-prefixed send opens a
+# completion popup within ~0.1s, exactly like tmux's claude/codex popups, so
+# the caller's <settle> before the first Enter matters here the same way it
+# does for tmux.
 #
-# Verification strategy differs from tmux's ANSI-ghost-aware composer read
-# (herdr's CLI has no cursor-row/ANSI capture primitive exposed): capture the
-# pane right after typing (before any Enter) as the TYPED baseline, then after
-# each Enter attempt capture again - if the capture is UNCHANGED from the typed
-# baseline, nothing happened (Enter was swallowed) and we retry; the moment the
-# capture changes (output appeared, prompt cleared, a popup closed and text
-# resolved), the send is considered submitted. Echoes empty|pending|unknown|
-# send-failed, the SAME vocabulary fm-send.sh already branches on for tmux.
+# Confirmation signal (rewritten for the 2026-07-07 incident below;
+# superseded a composer-content read that itself replaced a delta-based check
+# for the 2026-07-03 incident): when the target is legibly idle before Enter,
+# submission is confirmed by fm_backend_herdr_wait_for_working observing a
+# submit-active agent_status after Enter, NOT by reading the composer's own
+# row. This makes the normal confirmation path cross-agent: it is the same
+# semantic signal regardless of what text a harness's idle composer happens
+# to display.
+#
+# Incident (2026-07-07, followed up on 2026-07-08): a redelivery loop in the
+# away-mode daemon. Root cause: composer-content submit confirmation was too
+# sensitive to harness rendering details. Real claude/codex use bare prompt
+# rows, and real codex adds dynamic idle suggestions after `›`; the later
+# ANSI-aware composer classifier now handles the pre-injection guard for that
+# Codex shape, but idle-baseline submit confirmation deliberately stays on
+# native agent-state so delivery does not depend on composer text. Composer
+# content is retained for other callers (the away-mode daemon's PRE-injection
+# empty-box guard, still dispatched via fm_backend_composer_state /
+# fm_backend_herdr_composer_state) and for submit attempts whose pre-Enter
+# agent-state baseline is not legibly idle.
+#
+# This also still correctly handles the earlier 2026-07-03 incident (a
+# slash-command popup selection/placeholder-fill on the FIRST Enter is not a
+# genuine submission) without any popup-specific logic at all: filling a
+# composer placeholder never starts a turn, so agent_status simply never
+# reports "working" for that Enter, and the retry loop below sends a second
+# Enter exactly as it did before - the fix generalizes instead of special-
+# casing the popup shape.
+#
+# Failure-mode analysis (the two directions the caller-facing contract must
+# not get wrong - see docs/herdr-backend.md "Native agent-state submit
+# confirmation" for the empirical timing behind this):
+#   - Slow transition: fm_backend_herdr_wait_for_working samples repeatedly
+#     across herdr's per-attempt confirmation budget (not once at the end), so a
+#     transition landing partway through a window is still caught before this
+#     loop gives up and sends a needless extra Enter.
+#   - Instant round-trip (a turn starts AND returns to idle between two
+#     polls): unavoidable in the absolute, but bounded by how tightly polls
+#     are packed into the budget; real claude/codex measured first-working
+#     at 90-490ms, comfortably inside a several-hundred-ms, multiply-sampled
+#     window, so this has not been observed in practice. On the (unobserved)
+#     residual chance it happens, the verdict is "pending" and the caller
+#     never retypes - only re-sends Enter, which lands on an already-empty
+#     composer and is a no-op, not a duplicate delivery of <text> (see
+#     fm-send.sh/fm-supervise-daemon.sh: retyping only happens if a caller
+#     re-invokes this function from scratch with the same text after seeing
+#     an error, which is a human/escalation decision, not an automatic
+#     retry).
+# Echoes empty|pending|unknown|send-failed, the SAME vocabulary fm-send.sh
+# already branches on for tmux ("empty" means "confirmed submitted" for every
+# backend; how each backend confirms it is an internal decision - herdr's is
+# no longer literally "the composer read empty").
 fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
-  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 typed after i=0
+  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 verdict baseline confirm_sleep
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
   sleep "$settle"
-  typed=$(fm_backend_herdr_capture "$target" 6) || { printf 'unknown'; return 0; }
+  baseline=$(fm_backend_herdr_classify_submit_agent_status \
+    "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")")
+  confirm_sleep=$(fm_backend_herdr_submit_confirm_budget "$sleep_s")
   while :; do
     fm_backend_herdr_send_key "$target" Enter || true
-    sleep "$sleep_s"
-    after=$(fm_backend_herdr_capture "$target" 6) || { printf 'unknown'; return 0; }
-    if [ "$after" != "$typed" ]; then
-      printf 'empty'
-      return 0
+    if [ "$baseline" = idle ]; then
+      verdict=$(fm_backend_herdr_wait_for_working "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" \
+        "$confirm_sleep" "$FM_BACKEND_HERDR_SUBMIT_POLLS")
+    else
+      sleep "$sleep_s"
+      verdict=$(fm_backend_herdr_composer_state "$target")
     fi
+    case "$verdict" in
+      busy) printf 'empty'; return 0 ;;
+      empty) printf 'empty'; return 0 ;;
+      unknown) printf 'unknown'; return 0 ;;
+    esac
     i=$((i + 1))
     [ "$i" -lt "$retries" ] || { printf 'pending'; return 0; }
   done
@@ -499,24 +883,131 @@ fm_backend_herdr_kill() {  # <target>
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane close "$FM_BACKEND_HERDR_PANE" >/dev/null 2>&1 || true
 }
 
-# fm_backend_herdr_busy_state: semantic busy state from herdr's native
-# agent-state detection (agent.get), the "first backend where fm_session_busy_state
-# gets real semantics" per the design report. working -> busy (actively
-# generating); idle/done -> idle; blocked -> idle (a blocked agent is stuck
-# waiting on the human, not grinding - the watcher should treat it like a
-# stale pane needing attention, not suppress it as busy); unknown/unparseable
-# -> unknown, the caller's cue to fall back to pane-regex detection.
-fm_backend_herdr_busy_state() {  # <target>
-  fm_backend_herdr_target_ready "$1" || { printf 'unknown'; return 0; }
-  local out status
-  out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent get "$FM_BACKEND_HERDR_PANE" 2>/dev/null) || { printf 'unknown'; return 0; }
-  status=$(printf '%s' "$out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
-  case "$status" in
+# fm_backend_herdr_classify_agent_status: map a raw `agent get` agent_status
+# value to the adapter's watcher busy|idle|unknown vocabulary. working ->
+# busy (actively generating); idle/done -> idle; blocked -> idle (a blocked
+# agent is stuck waiting on the human, not grinding - the watcher should
+# treat it like a stale pane needing attention, not suppress it as busy);
+# unknown/unparseable/empty -> unknown, the caller's cue to fall back to
+# pane-regex detection.
+fm_backend_herdr_classify_agent_status() {  # <raw-agent_status>
+  case "$1" in
     working) printf 'busy' ;;
     idle|done) printf 'idle' ;;
     blocked) printf 'idle' ;;
     *) printf 'unknown' ;;
   esac
+}
+
+fm_backend_herdr_classify_submit_agent_status() {  # <raw-agent_status>
+  case "$1" in
+    working|blocked) printf 'busy' ;;
+    idle|done) printf 'idle' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# fm_backend_herdr_agent_status_raw: one `agent get` read, echoing the raw
+# agent_status string (working/idle/done/blocked/...), or empty on any
+# failure. Deliberately skips fm_backend_herdr_target_ready's server-ensure
+# round trip (an extra `status --json` call) that fm_backend_herdr_busy_state
+# pays on every call: fm_backend_herdr_wait_for_working polls this in a tight
+# loop right after a caller has already parsed the target and confirmed the
+# server is live (e.g. fm_backend_herdr_send_text_submit, immediately after a
+# successful send-text), so re-checking server liveness on every poll would
+# only add latency without adding safety.
+fm_backend_herdr_agent_status_raw() {  # <session> <pane_id>
+  local session=$1 pane_id=$2 out
+  out=$(fm_backend_herdr_cli "$session" agent get "$pane_id" 2>/dev/null) || { printf ''; return 0; }
+  printf '%s' "$out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null
+}
+
+# fm_backend_herdr_busy_state: semantic busy state from herdr's native
+# agent-state detection (agent.get), the "first backend where fm_session_busy_state
+# gets real semantics" per the design report. See
+# fm_backend_herdr_classify_agent_status for the status->busy/idle/unknown
+# mapping.
+fm_backend_herdr_busy_state() {  # <target>
+  fm_backend_herdr_target_ready "$1" || { printf 'unknown'; return 0; }
+  fm_backend_herdr_classify_agent_status \
+    "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")"
+}
+
+# fm_backend_herdr_wait_for_working: poll <session>:<pane_id>'s NATIVE
+# agent-state (agent get) up to <polls> times spread evenly across
+# <budget-seconds>, returning on stdout the STRONGEST signal observed:
+#
+#   busy    - a submit-active status was observed at least once. This is
+#             confirmation that a real turn started or reached a prompt -
+#             the submit landed - independent of
+#             whatever the composer's own text happens to show (docs/
+#             herdr-backend.md "Incident (2026-07-07)": composer content is
+#             what fooled the OLD confirmation on codex's dynamic idle-tip
+#             text). Returned the INSTANT it is seen, without waiting out the
+#             rest of the budget.
+#   idle    - the target was legibly read at least once and never reported
+#             "busy" across the whole window - a genuine "not (yet)
+#             submitted" signal, not a read failure. The caller retries
+#             Enter on this verdict.
+#   unknown - EVERY poll in the window failed to read the target at all (a
+#             hard I/O failure - pane gone, socket error - not a timing
+#             race). The caller must not keep retrying Enter against a target
+#             it cannot even read.
+#
+# <polls> spread across <budget-seconds> (rather than one check at the end)
+# is what makes this robust against a SLOW transition: a caller now gets
+# several samples across that window instead of a single one, so a transition
+# that lands partway through is not missed just because it had not landed by
+# the FIRST sample.
+# Empirical evidence (docs/herdr-backend.md "Native agent-state submit
+# confirmation"): real claude and codex observed first-working at 90-490ms
+# after Enter, so a several-hundred-ms budget sampled repeatedly reliably
+# catches it. The remaining, inherent gap - a turn so fast it starts AND
+# returns to idle between two samples - is bounded by how tightly <polls> is
+# packed into <budget-seconds>; nothing observed in real testing has come
+# close to that, but it is a residual risk, not a mathematical impossibility
+# (see the doc section for the full characterization and the failure-mode
+# analysis for both directions this must guard).
+# FM_BACKEND_HERDR_SUBMIT_POLLS (default 6): how many samples
+# fm_backend_herdr_send_text_submit spreads across each Enter attempt's
+# confirmation budget. Overridable for tests (a value of 1
+# reproduces the old single-check-at-the-end timing exactly, for byte-for-byte
+# call-count assertions).
+FM_BACKEND_HERDR_SUBMIT_POLLS=${FM_BACKEND_HERDR_SUBMIT_POLLS:-6}
+FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP=${FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP:-0.6}
+
+fm_backend_herdr_submit_confirm_budget() {  # <caller-budget-seconds>
+  awk -v b="${1:-0}" -v m="$FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP" 'BEGIN {
+    b += 0
+    m += 0
+    if (b < 0) b = 0
+    if (m < 0) m = 0
+    if (m > b) b = m
+    printf "%.4f", b
+  }' 2>/dev/null || printf '%s' "${1:-0}"
+}
+
+fm_backend_herdr_wait_for_working() {  # <session> <pane_id> <budget-seconds> <polls>
+  local session=$1 pane_id=$2 budget=$3 polls=${4:-1} i interval raw bs saw_idle=0
+  case "$polls" in ''|*[!0-9]*|0) polls=1 ;; esac
+  interval=$(awk -v b="$budget" -v p="$polls" 'BEGIN { d = p - 1; if (d < 1) d = 1; v = b / d; if (v < 0) v = 0; printf "%.4f", v }' 2>/dev/null)
+  case "$interval" in ''|*[!0-9.]*) interval=0 ;; esac
+  for ((i = 0; i < polls; i++)); do
+    if [ "$polls" -eq 1 ] || [ "$i" -gt 0 ]; then
+      sleep "$interval"
+    fi
+    raw=$(fm_backend_herdr_agent_status_raw "$session" "$pane_id")
+    bs=$(fm_backend_herdr_classify_submit_agent_status "$raw")
+    case "$bs" in
+      busy) printf 'busy'; return 0 ;;
+      idle) saw_idle=1 ;;
+    esac
+  done
+  if [ "$saw_idle" -eq 1 ]; then
+    printf 'idle'
+  else
+    printf 'unknown'
+  fi
 }
 
 # fm_backend_herdr_pane_for_tab: the root pane id for <tab_id> in <workspace_id>
@@ -579,4 +1070,260 @@ fm_backend_herdr_list_live() {  # <session>
     [ -n "$pane_id" ] || continue
     printf '%s:%s\t%s\n' "$session" "$pane_id" "$label"
   done < <(printf '%s' "$tabs" | jq -r '.result.tabs[]? | select(.label | startswith("fm-")) | "\(.tab_id)\t\(.label)"' 2>/dev/null)
+}
+
+# --- native event push: pane.agent_status_changed subscriber -----------------
+#
+# The push half of the immediate blocked-state escalation (AGENTS.md section 8,
+# docs/herdr-backend.md "Native pane.agent_status_changed push escalation").
+# fm_backend_herdr_wait_transition is the watcher's bounded wait primitive for
+# herdr homes: instead of a blind sleep, it blocks on herdr's native event
+# stream and returns the instant a subscribed pane transitions to `blocked`, so
+# a crew waiting on the human wakes its supervisor sub-second instead of after
+# the ~240s stale-pane wedge timer. Everything not `blocked` is streamed too
+# (the policy, not the subscription, makes `blocked` the sole immediate action)
+# so `working` edges clear the per-pane dedupe marker. Polling stays the
+# permanent fail-closed backstop: below-capability, a connect/subscribe failure,
+# or a missing reader all fall back to the caller sleeping the same budget.
+
+# fm_backend_herdr_socket_path: the control-socket path for <session>, read from
+# `herdr session list --json` (the default session's socket differs from a named
+# session's - verified: default -> ~/.config/herdr/herdr.sock, named ->
+# ~/.config/herdr/sessions/<name>/herdr.sock). Empty on any failure.
+fm_backend_herdr_socket_path() {  # <session>
+  local session=$1
+  herdr session list --json 2>/dev/null \
+    | jq -r --arg name "$session" '.sessions[]? | select(.name == $name) | .socket_path // empty' 2>/dev/null \
+    | head -1
+}
+
+# fm_backend_herdr_events_capable: the version/capability gate for the event
+# fast-path (report section 5c trigger 1). Fails closed to the poll loop unless
+# ALL hold: herdr+jq present; the raw-socket reader available (python3, unless a
+# reader override is configured); client protocol >= FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL;
+# and both `events.subscribe` and `pane.agent_status_changed` present in `herdr
+# api schema`. FM_BACKEND_HERDR_EVENTS_FORCE overrides the whole verdict for
+# tests (1 = capable, 0 = incapable) without touching the real binary. The
+# `api schema` read is ~220KB, so callers (the watcher) memoize this per session
+# for a process lifetime rather than probing every poll.
+fm_backend_herdr_events_capable() {  # <session>
+  local session=$1 protocol schema
+  case "${FM_BACKEND_HERDR_EVENTS_FORCE:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  fm_backend_herdr_tool_check || return 1
+  if [ -z "${FM_BACKEND_HERDR_EVENT_READER:-}" ]; then
+    command -v python3 >/dev/null 2>&1 || return 1
+  fi
+  protocol=$(herdr status --json 2>/dev/null | jq -r '.client.protocol // empty' 2>/dev/null)
+  case "$protocol" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$protocol" -ge "$FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL" ] || return 1
+  schema=$(herdr api schema --json 2>/dev/null) || return 1
+  printf '%s' "$schema" | grep -Fq 'events.subscribe' || return 1
+  printf '%s' "$schema" | grep -Fq 'pane.agent_status_changed' || return 1
+  return 0
+}
+
+# fm_backend_herdr_normalize_event: THE single normalize point (report section 5
+# refinement: one backend transition shape, one parse point). Both the stream
+# reader's projected lines AND the level-reconcile's `agent get` reads flow
+# through here into the shared normalized-transition record. herdr's event
+# carries no previous status and its stream is edge-triggered, so from_status is
+# left empty; to_status drives the policy.
+fm_backend_herdr_normalize_event() {  # <pane_id> <workspace_id> <agent_status> <agent>
+  fm_transition_record "${1:-}" "${2:-}" "" "${3:-}" "${4:-}"
+}
+
+# fm_backend_herdr_event_reader_cmd: emit the reader argv (one word per line) for
+# the raw-socket subscriber. Default: `python3 <this dir>/herdr-eventwait.py`.
+# FM_BACKEND_HERDR_EVENT_READER overrides it with a whitespace-split command so
+# tests can substitute a fake reader that replays canned stream lines.
+fm_backend_herdr_event_reader_cmd() {
+  local word
+  if [ -n "${FM_BACKEND_HERDR_EVENT_READER:-}" ]; then
+    for word in $FM_BACKEND_HERDR_EVENT_READER; do
+      printf '%s\n' "$word"
+    done
+    return 0
+  fi
+  printf 'python3\n'
+  printf '%s\n' "$FM_BACKEND_HERDR_ROOT/bin/backends/herdr-eventwait.py"
+}
+
+# fm_backend_herdr_escalation_marker: the per-pane dedupe marker path for a
+# <window> ("<session>:<pane_id>"), keyed identically to the watcher's
+# .stale-<key> (tr ':/.' '___'), under <state_dir>.
+fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
+  local state=$1 window=$2 key
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s/%s%s' "$state" "$FM_BACKEND_HERDR_ESCALATED_PREFIX" "$key"
+}
+
+# fm_backend_herdr_apply_transition: route one normalized record through the
+# shared policy table, maintaining the per-pane dedupe marker under <state_dir>.
+# On a fresh `actionable` (blocked) edge - policy actionable AND no marker yet -
+# it prints the record on stdout and returns 0 (the caller stops and hands the
+# record up). The caller commits the marker only after handling the record.
+# `absorb` (working) clears the marker and
+# returns 1. `defer`/`fallback`, and an already-marked `actionable`, return 1
+# with no output. <session> reconstructs the window ("<session>:<pane_id>") for
+# the marker key, matching the watcher's own key scheme.
+fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
+  local state=$1 session=$2 record=$3 pane_id to action window marker
+  pane_id=$(fm_transition_pane_id "$record")
+  [ -n "$pane_id" ] || return 1
+  to=$(fm_transition_to_status "$record")
+  action=$(fm_transition_policy "$to")
+  window="$session:$pane_id"
+  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
+  case "$action" in
+    actionable)
+      if [ ! -e "$marker" ]; then
+        printf '%s' "$record"
+        return 0
+      fi
+      ;;
+    absorb)
+      rm -f "$marker" 2>/dev/null || true
+      ;;
+  esac
+  return 1
+}
+
+fm_backend_herdr_commit_transition() {  # <state_dir> <session> <record>
+  local state=$1 session=$2 record=$3 pane_id window marker
+  pane_id=$(fm_transition_pane_id "$record")
+  [ -n "$pane_id" ] || return 1
+  window="$session:$pane_id"
+  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
+  : > "$marker"
+}
+
+fm_backend_herdr_clear_transition() {  # <state_dir> <window>
+  local state=$1 window=$2 marker
+  [ -n "$window" ] || return 0
+  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
+  rm -f "$marker" 2>/dev/null || true
+}
+
+# fm_backend_herdr_wait_transition: the bounded event wait. Blocks up to
+# <timeout_secs> for one of <pane_window...> ("<session>:<pane_id>") to reach a
+# fresh `blocked` edge, then prints the normalized record and returns 0.
+# Returns 1 on a clean timeout (the reader ran the full budget, no fresh
+# actionable edge - the caller has effectively already slept and just continues)
+# and 2 when the event path is unusable (not capable, socket unresolved, reader
+# failed to run/subscribe - the caller sleeps the budget itself, the fail-closed
+# backstop). See the header block above for the full contract.
+fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pane_window...>
+  local session=$1 timeout=$2 state=$3
+  shift 3
+  local windows=("$@")
+  [ "${#windows[@]}" -gt 0 ] || return 2
+  if [ "${FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED:-0}" != 1 ]; then
+    fm_backend_herdr_events_capable "$session" || return 2
+  fi
+  local sock
+  sock=$(fm_backend_herdr_socket_path "$session")
+  [ -n "$sock" ] || return 2
+
+  # Map each window to its herdr pane id (strip the leading "<session>:").
+  local w pane_id
+  local pane_ids=()
+  for w in "${windows[@]}"; do
+    pane_id=${w#*:}
+    if [ -z "$pane_id" ] || [ "$pane_id" = "$w" ]; then
+      continue
+    fi
+    pane_ids+=("$pane_id")
+  done
+  [ "${#pane_ids[@]}" -gt 0 ] || return 2
+
+  # Start the raw-socket reader and wait for its subscription acknowledgement
+  # before level reconciliation, so edges occurring during reconciliation are
+  # already buffered in the live stream.
+  local reader=()
+  while IFS= read -r w; do
+    reader+=("$w")
+  done < <(fm_backend_herdr_event_reader_cmd)
+  [ "${#reader[@]}" -gt 0 ] || return 2
+
+  local fifo_dir fifo reader_pid line ws status agent raw record hit rc=1 reader_rc=0
+  fifo_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-herdr-eventwait.XXXXXX") || return 2
+  fifo="$fifo_dir/events"
+  if ! mkfifo "$fifo" 2>/dev/null; then
+    rm -rf "$fifo_dir" 2>/dev/null || true
+    return 2
+  fi
+  "${reader[@]}" "$sock" "$timeout" "${pane_ids[@]}" > "$fifo" 2>/dev/null &
+  reader_pid=$!
+  if ! exec 9< "$fifo"; then
+    kill "$reader_pid" 2>/dev/null || true
+    wait "$reader_pid" 2>/dev/null || true
+    rm -rf "$fifo_dir" 2>/dev/null || true
+    return 2
+  fi
+  if ! IFS= read -r -u 9 line || [ "$line" != "@subscribed" ]; then
+    rc=2
+  fi
+
+  # Level reconcile on (re)connect (report section 3d): a pane already `blocked`
+  # during the gap since the last subscription is returned now, once, while
+  # newer edges accumulate in the active stream. `working` panes clear their
+  # marker here too.
+  if [ "$rc" -ne 2 ]; then
+    for w in "${windows[@]}"; do
+      pane_id=${w#*:}
+      if [ -z "$pane_id" ] || [ "$pane_id" = "$w" ]; then
+        continue
+      fi
+      raw=$(fm_backend_herdr_agent_status_raw "$session" "$pane_id")
+      [ -n "$raw" ] || continue
+      record=$(fm_backend_herdr_normalize_event "$pane_id" "" "$raw" "")
+      if hit=$(fm_backend_herdr_apply_transition "$state" "$session" "$record"); then
+        printf '%s' "$hit"
+        rc=0
+        break
+      fi
+    done
+  fi
+
+  # Drain stream edges until a fresh blocked edge or the timeout. The reader is
+  # a subprocess of this call (NOT a second watcher), and is killed the instant
+  # a blocked edge is found.
+  # Split each raw projected line (pane_id\tworkspace_id\tagent_status\tagent)
+  # with `cut`, NOT `IFS=$'\t' read`: a tab is IFS-whitespace, so `read` would
+  # collapse an empty middle field (e.g. an absent workspace_id) and shift the
+  # status into the wrong column. `cut` preserves empty fields.
+  while [ "$rc" -eq 1 ] && IFS= read -r line <&9; do
+    [ -n "$line" ] || continue
+    pane_id=$(printf '%s' "$line" | cut -f1)
+    ws=$(printf '%s' "$line" | cut -f2)
+    status=$(printf '%s' "$line" | cut -f3)
+    agent=$(printf '%s' "$line" | cut -f4)
+    [ -n "$pane_id" ] || continue
+    record=$(fm_backend_herdr_normalize_event "$pane_id" "$ws" "$status" "$agent")
+    if hit=$(fm_backend_herdr_apply_transition "$state" "$session" "$record"); then
+      printf '%s' "$hit"
+      rc=0
+      break
+    fi
+  done
+  if [ "$rc" -eq 0 ]; then
+    kill "$reader_pid" 2>/dev/null || true
+  fi
+  if [ "$rc" -eq 2 ]; then
+    kill "$reader_pid" 2>/dev/null || true
+  fi
+  # No actionable edge: distinguish a clean full-budget wait (reader exit 0 ->
+  # return 1, caller already waited) from a reader error (connect/subscribe
+  # failure, exit non-zero -> return 2, caller sleeps and counts toward the
+  # runtime-disable threshold).
+  wait "$reader_pid" 2>/dev/null || reader_rc=$?
+  exec 9<&-
+  rm -rf "$fifo_dir" 2>/dev/null || true
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 2 ] && return 2
+  [ "$reader_rc" -eq 0 ] && return 1
+  return 2
 }

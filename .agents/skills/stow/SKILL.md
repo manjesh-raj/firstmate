@@ -2,7 +2,11 @@
 name: stow
 description: Sweep the current session for uncaptured durable knowledge and file it to disk before a context reset. Use when the captain invokes /stow (e.g. "/stow", "stow what you've learned"), before a session reset or context compaction, or periodically to keep operational memory current.
 user-invocable: true
+metadata:
+  internal: true
 ---
+
+<!-- maintainers: this is the firstmate-internal skill. The public, installer-facing counterpart lives at skills/stow/SKILL.md - deliberately a separate file with no shared code or environment branching. Keep them independent. -->
 
 # stow
 
@@ -25,17 +29,26 @@ The goal is a session that is safe to reset or destroy because everything durabl
 
 3. **Write within firstmate's existing write boundaries.**
    This skill does not grant any new write permission; it only prompts firstmate to use the boundaries that already exist (AGENTS.md section 1):
-   - Captain preferences and fleet-local operational facts: hand-write directly, to `data/captain.md` and `data/learnings.md` respectively.
-     `data/learnings.md` may not exist yet; create it on first learning, in the same dated, evidence-backed, curated style as `data/captain.md` - rewrite and prune stale or superseded entries rather than appending forever.
+   - Captain preferences and fleet-local operational facts: hand-write directly, to `data/captain.md` and `data/learnings.md` respectively, using inspect-then-update every time.
+     Before writing, inspect the destination, find the existing bullet or section the finding duplicates or supersedes, and rewrite it in place rather than adding a new trailing entry.
+     `data/learnings.md` may not exist yet; create it on first learning, in the same dated, evidence-backed, curated style as `data/captain.md`.
    - Project-intrinsic knowledge: never hand-write a project's `AGENTS.md`.
      Route it through a normal ship task so a crewmate records it via `bin/fm-ensure-agents-md.sh` and commits it through that project's delivery pipeline, exactly as section 6 describes.
      If the fleet is live, delegate this to a crewmate rather than doing it inline.
    - Knowledge generalizable to every firstmate user: this repo's own `AGENTS.md` (or other shared, tracked material), shipped through the normal branch -> no-mistakes -> PR -> captain-merge pipeline for this repo (section 1), never hand-committed straight to `main`.
-   - Task-scoped notes: append to the relevant backlog item's notes with `tasks-axi update <id> --append "<note>"`, or hand-edit `data/backlog.md` per the active backend (section 10).
+   - Task-scoped notes: inspect the relevant backlog item with `tasks-axi show <id> --full`, judge whether the new note is new, duplicate, superseding, or obsolete, then write a considered replacement body with `tasks-axi update <id> --body-file <path>`.
+     When the replacement intentionally supersedes prior state that should remain recoverable, add `--archive-body` to that update command so the prior body stays recoverable without copying it into the replacement.
+     Never append.
+     If hand-editing `data/backlog.md` per the active backend, make the same inspect-then-update edit in place.
    - Undone next steps: file each as a queued backlog item (section 10), with `blocked-by` recorded if it genuinely depends on something else.
 
-4. **Curate, don't just append.**
-   When a finding overlaps or supersedes something already on disk, prefer rewriting or pruning the existing entry over piling on a new one.
+4. **Curate with inspect-then-update.**
+   Every write starts by reading the current destination and deciding how the finding changes what is already there.
+   Use this checklist before writing:
+   - Which existing bullet, section, or task body does this supersede?
+   - Can this be a one-sentence rewrite instead of a new entry?
+   - Should an older bullet or note be deleted, retired, or archived because it is now obsolete?
+   When a finding overlaps or supersedes something already on disk, rewrite or prune the existing entry instead of piling on a new one.
    Graduation moves are limited to exactly three: promote a learning to the shared `AGENTS.md` via PR, fold it into `data/captain.md`, or delete a stale entry.
    Do not invent other graduation paths.
 
@@ -47,6 +60,6 @@ The goal is a session that is safe to reset or destroy because everything durabl
 
 `/stow` must **never** store, create, or edit a skill as a destination for any finding.
 There is no "graduate this to a skill" move in this skill's routing.
-This is a deliberate, standing exclusion, not an oversight: repo skills cannot yet distinguish knowledge that is fleet-local to this captain's home from knowledge generalizable to every firstmate user, so writing learnings into skills would silently leak fleet-local material into shared, tracked material (or vice versa).
-That namespace problem is unresolved and deliberately deferred.
-Until it is resolved, route generalizable knowledge to the shared `AGENTS.md` (or other shared, tracked material) via the pipeline, and fleet-local knowledge to `data/`, never to a skill.
+This is a deliberate, standing exclusion, not an oversight: even with the two-tier skill layout, a stow sweep is a memory-routing operation, not a way to author or mutate skills.
+Writing learnings into either `.agents/skills/` or public `skills/` would still risk mixing fleet-local material with shared firstmate behavior or standalone installer-facing behavior.
+Until a human deliberately scopes a skill change as firstmate repo work, route generalizable knowledge to the shared `AGENTS.md` (or other shared, tracked material) via the pipeline, and fleet-local knowledge to `data/`, never to a skill.

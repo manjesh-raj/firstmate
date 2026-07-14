@@ -1,51 +1,75 @@
 # The bin/ toolbelt
 
 The first mate drives these; interactive entrypoints work by hand too, while `*-lib.sh` files are sourced helpers.
-Each file also starts with a short header comment.
+Each row is one purpose clause only: the script's own header comment is the authoritative description of its behavior, flags, and contracts, so read the header before first use.
+If you have changed away from the firstmate home in an interactive shell, invoke these scripts by absolute path through the repo's `bin/` directory; the scripts self-locate internally after they start.
+The shared no-mistakes gate refusal used by `fm-spawn.sh`, `fm-send.sh`, and `fm-teardown.sh` is summarized in [architecture.md](architecture.md#no-mistakes-gate-authority-boundary); `fm-gate-refuse-lib.sh`'s header owns its exact contract.
 
-| Script                   | Description                                                                                                         |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| `fm-session-start.sh`    | The one command AGENTS.md sections 3 and 5 run at every session start: composes `fm-lock.sh`, `fm-bootstrap.sh` (its three mutating sweeps gated on holding the lock via `FM_BOOTSTRAP_DETECT_ONLY`), and `fm-wake-drain.sh`, then prints a full context digest (`data/projects.md`, `data/secondmates.md`, `data/captain.md`, `data/learnings.md`, each `ABSENT`-marked when missing) and fleet-state digest (`data/backlog.md`, every `state/*.meta`, a bounded `state/*.status` tail, `state/.afk`, and a cheap per-task endpoint-liveness read); prints a loud read-only banner and skips every mutating step when the lock is held elsewhere; never arms the watcher itself |
-| `fm-bootstrap.sh`        | Detect required toolchain and version problems, dispatch profile JSON errors or active-rule blocks, default backlog-backend status, primary-checkout `TANGLE:` problems, and actionable clone refresh outcomes; refresh project clones best-effort; locally sync live secondmate homes and propagate declared inheritable config; set up opt-in X mode; install tools only after consent; `FM_BOOTSTRAP_DETECT_ONLY=1` skips the three mutating sweeps and prints advisory-only `TANGLE:` wording without a checkout command |
-| `fm-fleet-sync.sh`       | Fetch clones, fast-forward safe default-branch states, self-heal clean detached ancestor drift, report unsafe drift as `STUCK:`, and safely prune branches whose remote is gone |
-| `fm-update.sh`           | Self-update the running firstmate repo and registered secondmate homes with fast-forward-only pulls from origin     |
-| `fm-backlog-handoff.sh`  | Move already-judged in-scope queued backlog items from the main home into a seeded secondmate home                 |
-| `fm-brief.sh`            | Scaffold a ship brief with a worktree-isolation assertion, a report-only scout brief with `--scout`, or a secondmate charter with `--secondmate` |
-| `fm-ensure-agents-md.sh` | Ensure project `AGENTS.md` is the real memory file and `CLAUDE.md` symlinks to it                                   |
-| `fm-guard.sh`            | Warn when the primary checkout is tangled, when queued wakes are pending, or when a stale or missing watcher needs a prominent banner; `FM_GUARD_READ_ONLY=1` keeps the alarms but suppresses drain, arm, and checkout repair commands |
-| `fm-home-seed.sh`        | Lease/provision a secondmate home transactionally, clone projects, initialize gates, and maintain `data/secondmates.md` |
-| `fm-spawn.sh`            | Spawn one task, several `id=repo` pairs, or a persistent secondmate with `--secondmate`; accepts concrete `--harness`, `--model`, `--effort`, and `--backend` axes; ship/scout spawns require an explicit resolved harness when dispatch profiles are active and an isolated treehouse worktree, install per-harness turn-end signaling, and secondmate spawns resolve the secondmate harness plus optional `config/secondmate-harness` model/effort tokens, locally sync the home, propagate declared inheritable config, and land herdr tabs in the target home's workspace before launch |
-| `fm-backend.sh`          | Runtime session-provider backend selector with explicit/env/config/runtime auto-detection precedence, meta helper, selector resolver, and operation dispatcher; defaults absent `backend=` meta to `tmux`; `fm_backend_target_exists` is a cheap read-only alive/dead endpoint check that never starts a server or session |
-| `backends/tmux.sh`       | Verified tmux session-provider adapter used by `fm-backend.sh`; owns create, send, capture, current-path, live-window, and kill primitives |
-| `backends/herdr.sh`      | Experimental herdr session-provider adapter used by `fm-backend.sh`; owns version/tool gating, per-home workspace/tab creation, created-vs-adopted default-tab prune safety, session-scoped CLI calls, send, capture, native busy-state, current-path, label-based live discovery, and kill primitives |
-| `fm-config-push.sh`      | Config-only mid-session push of declared inheritable local config into live secondmate homes; reports each item as pushed, unchanged, skipped, or error without fast-forwarding tracked files or nudging agents |
-| `fm-project-mode.sh`     | Resolve a project's delivery mode and `+yolo` flag from `data/projects.md`                                          |
-| `fm-merge-local.sh`      | Fast-forward a `local-only` project's local default branch after approval                                           |
-| `fm-review-diff.sh`      | Review a crewmate branch against the authoritative base, with optional `--stat` output                              |
-| `fm-marker-lib.sh`       | Shared from-firstmate request marker and detector sourced by `fm-send.sh`, `fm-brief.sh`, and tests                 |
-| `fm-watch-arm.sh`        | Verified per-home watcher re-arm; reports `started`, `healthy`, or `FAILED`; `--restart` relaunches only this home's watcher |
-| `fm-watch.sh`            | Singleton-safe always-on watcher and default pull-based event source; uses backend-native busy state when available before the shared regex fallback, absorbs no-verb signal and stale wakes only when the crew is provably working, queues and exits for actionable wakes, and reverts to daemon-owned one-shot behavior while `state/.afk` exists |
-| `fm-supervise-daemon.sh` | Presence-gated sub-supervisor for walk-away (`/afk`) supervision: wraps `fm-watch.sh`, uses the shared wake classifier and backend-aware stale rechecks, self-handles routine wakes in bash, and escalates only captain-relevant events as one verified, batched, single-line digest prefixed with a sentinel marker |
-| `fm-crew-state.sh`       | Print one stable current-state line for a crew by reconciling its matching no-mistakes run-step, even when the pane has closed, with backend-aware pane fallback that corroborates native idle/unknown verdicts before the status log |
-| `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification sourced by bootstrap and guard         |
-| `fm-ff-lib.sh`           | Shared guarded fast-forward helper for `/updatefirstmate` origin pulls and no-fetch local secondmate syncs         |
-| `fm-config-inherit-lib.sh` | Shared primary->secondmate inheritable-config propagation (a declared, extensible item list - currently `config/crew-dispatch.json`, `config/crew-harness`, and `config/backlog-backend`) sourced by spawn, bootstrap, and config push |
-| `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe sourced by bootstrap and teardown              |
-| `fm-wake-drain.sh`       | Atomically drain queued watcher wakes before handling supervision work, then run the watcher-liveness guard         |
-| `fm-wake-lib.sh`         | Shared durable wake queue and portable lock helpers sourced by the watcher, drain, arm, guard, and daemon          |
-| `fm-classify-lib.sh`     | Shared captain-relevant wake classifier sourced by the watcher and daemon, plus the watcher's provably-working predicate |
-| `fm-send.sh`             | Send one verified literal line (or `--key Escape`) through the target's recorded runtime backend; exits non-zero on confirmed swallowed Enter; bare `kind=secondmate` targets are marked as from-firstmate; slash commands and codex `$...` skill invocations get popup-settle before Enter; text sends pause `FM_SEND_SETTLE` seconds after success |
-| `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, dim-ghost-aware and border-aware composer detection, and verified submit retry |
-| `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint through the target's recorded runtime backend                            |
-| `fm-pr-check.sh`         | Record `pr=` and GitHub's `pr_head=` when available for a PR-ready task, then arm the watcher's merge poll          |
-| `fm-pr-merge.sh`         | Require a full GitHub PR URL, record `pr=` and available `pr_head=` via `fm-pr-check.sh`, parse it into `gh-axi pr merge <n> --repo <owner>/<repo>`, default to `--squash` unless a merge method is forwarded, and reject malformed URLs or repo overrides |
-| `fm-promote.sh`          | Promote a scout task in place so it becomes a protected ship task                                                   |
-| `fm-teardown.sh`         | Return a clean, landed ship worktree or retire/release a secondmate home; requires scout reports, checks child work, removes firstmate-owned hook artifacts, and prints the backlog-backend reminder |
-| `fm-harness.sh`          | Detect the running harness; resolve the effective crewmate (`crew`) or secondmate-launch (`secondmate`) harness; expose optional `config/secondmate-harness` model and effort tokens with `secondmate-model` and `secondmate-effort` |
-| `fm-lock.sh`             | Per-home firstmate session lock                                                                                     |
-| `fm-x-lib.sh`            | Shared X-mode `.env`, alternate env-file, relay, dry-run config, reply-thread splitting, outbound image payloads, and task-to-X-request meta-link helpers |
-| `fm-x-poll.sh`           | Do one bounded X relay poll; without `FMX_PAIRING_TOKEN` it is silent, with a pending mention it stashes the full inbox JSON, including `in_reply_to`, and prints `x-mention <request_id>` |
-| `fm-x-reply.sh`          | Post or dry-run preview a composed public-safe X answer or `--followup`, auto-splitting long text into `{request_id,text,texts}` threads and optionally attaching `--image <path>` to the opener; reads text from an argument, stdin, or `--text-file` |
-| `fm-x-dismiss.sh`        | Dismiss or dry-run preview a skipped X mention without replying by sending `{request_id}` to the relay's `connector/dismiss` endpoint |
-| `fm-x-link.sh`           | Link a spawned task to its originating X mention by recording `x_request=` and `x_request_ts=` in `state/<id>.meta` |
-| `fm-x-followup.sh`       | Detect, post, and clear the single completion follow-up for an X-linked task, forwarding optional `--image <path>`, enforcing the local 24h window, and retrying only when the relay post fails |
+| Script                   | Purpose                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------ |
+| `fm-session-start.sh`    | Compose lock, bootstrap, and wake drain into the single ordered session-start digest |
+| `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
+| `fm-fleet-sync.sh`       | Refresh project clones with safe fast-forwards, self-heals, `STUCK:` reports, branch pruning, and bounded recovery from an orphaned `.git/packed-refs.lock` |
+| `fm-fleet-snapshot.sh`   | Print the read-only structured fleet snapshot JSON (schema `fm-fleet-snapshot.v1`)   |
+| `fm-fleet-view.sh`       | Render the fleet snapshot as a human Markdown view                                   |
+| `fm-bearings-snapshot.sh` | Project the fleet snapshot to the compact TOON bearings view; local-only unless `--include-prs` |
+| `fm-update.sh`           | Fast-forward-only self-update of firstmate and secondmate homes from origin          |
+| `fm-backlog-handoff.sh`  | Validate and delegate queued backlog-item moves into a secondmate home               |
+| `fm-brief.sh`            | Scaffold ship, scout, secondmate-charter, and Herdr-lab briefs                       |
+| `fm-herdr-lab.sh`        | Provision and guardedly operate an isolated, never-default Herdr lab session         |
+| `fm-ensure-agents-md.sh` | Ensure a project's real `AGENTS.md`, its `CLAUDE.md` symlink, and the canonical self-governance section |
+| `fm-guard.sh`            | Warn on primary-checkout tangles, pending queued wakes, and stale watcher liveness   |
+| `fm-turnend-guard.sh`    | Shared primary turn-end guard predicate so no turn ends blind (docs/turnend-guard.md) |
+| `fm-turnend-guard-grok.sh` | Grok Stop-hook adapter for the primary turn-end guard                              |
+| `fm-arm-pretool-check.sh` | Stable PreToolUse transport for the watcher-arm command policy (docs/arm-pretool-check.md) |
+| `fm-arm-command-policy.mjs` | Semantic owner of the watcher-arm PreToolUse policy (docs/arm-pretool-check.md)   |
+| `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
+| `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
+| `fm-spawn.sh`            | Spawn crewmates, scouts, `id=repo` batches, and secondmates on the resolved harness and runtime backend |
+| `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule to one concrete profile, owning `quota-balanced` selection |
+| `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
+| `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |
+| `fm-composer-lib.sh`     | Single fleet-wide owner of composer-content classification for all backends          |
+| `backends/tmux.sh`       | Verified tmux session-provider adapter                                               |
+| `backends/herdr.sh`      | Experimental herdr session-provider adapter                                          |
+| `backends/zellij.sh`     | Experimental zellij session-provider adapter                                         |
+| `backends/orca.sh`       | Experimental Orca backend adapter owning both worktree and terminal                  |
+| `backends/cmux.sh`       | Experimental cmux session-provider adapter                                           |
+| `fm-config-push.sh`      | Push declared inheritable local config to live secondmate homes mid-session          |
+| `fm-project-mode.sh`     | Resolve a project's delivery mode and `+yolo` flag from `data/projects.md`           |
+| `fm-merge-local.sh`      | Fast-forward a `local-only` project's local default branch after approval            |
+| `fm-review-diff.sh`      | Review a crewmate branch or recorded PR head against the authoritative base          |
+| `fm-marker-lib.sh`       | Shared from-firstmate request marker, detector, and idempotent transformation         |
+| `fm-gate-refuse-lib.sh`  | Shared no-mistakes gate-context refusal for fleet lifecycle entrypoints               |
+| `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with honest status reporting                |
+| `fm-watch-checkpoint.sh` | Run one bounded foreground watcher checkpoint for Codex-style supervision            |
+| `fm-watch.sh`            | Singleton-safe always-on watcher: absorb benign wakes, queue and exit on actionable ones |
+| `fm-afk-start.sh`        | Run the common sourceable away-mode daemon entry in the foreground                      |
+| `fm-afk-launch.sh`       | Own away-mode entry, exit, rollback, and any backend terminal lifecycle                 |
+| `fm-supervisor-target-lib.sh` | Resolve the shared supervisor target and backend for the daemon and launcher       |
+| `fm-supervise-daemon.sh` | Presence-gated away-mode sub-supervisor: self-handle routine wakes, escalate batched digests, alert on failed delivery |
+| `fm-crew-state.sh`       | Print one deterministic current-state line for a crew                                |
+| `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |
+| `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
+| `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |
+| `fm-lock-lib.sh`         | Shared "is this git lock provably abandoned?" proof used by teardown and fleet-sync   |
+| `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inheritable-config propagation                        |
+| `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
+| `fm-wake-drain.sh`       | Atomically drain queued watcher wakes, then assert watcher liveness                  |
+| `fm-wake-lib.sh`         | Shared durable wake queue, portable locks, and watcher identity/health helpers       |
+| `fm-classify-lib.sh`     | Shared captain-relevant and declared-external-wait wake classification vocabulary    |
+| `fm-send.sh`             | Send one verified literal line or supported key through the target's recorded backend |
+| `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, composer capture, and verified submit |
+| `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint                                          |
+| `fm-pr-check.sh`         | Record `pr=` and `pr_head=` for a PR-ready task, then arm the watcher's merge poll   |
+| `fm-pr-merge.sh`         | Record PR metadata, then merge a task's PR from its full GitHub URL                  |
+| `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
+| `fm-teardown.sh`         | Fail-closed teardown: return landed ship worktrees, require scout reports, retire secondmate homes |
+| `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |
+| `fm-lock.sh`             | Per-home firstmate session lock                                                      |
+| `fm-x-lib.sh`            | Shared X-mode config, relay, and reply-threading helpers                             |
+| `fm-x-poll.sh`           | One bounded X relay poll: stash pending mentions, print `x-mention <request_id>`     |
+| `fm-x-reply.sh`          | Post or dry-run preview a composed X-mode reply or follow-up                         |
+| `fm-x-dismiss.sh`        | Dismiss a skipped X-mode mention at the relay without replying                       |
+| `fm-x-link.sh`           | Link a spawned task to its originating X-mode mention in task meta                   |
+| `fm-x-followup.sh`       | Detect, post, and cap completion follow-ups for an X-mode-linked task                |
