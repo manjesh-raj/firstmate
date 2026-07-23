@@ -27,12 +27,12 @@
 #   caller-supplied repo string cannot reliably identify this repo. Briefs made
 #   without it carry a loud declaration so an omitted contract cannot be silent.
 # For ship tasks, the definition of done is shaped by the project's delivery mode
-# (data/projects.md via fm-project-mode.sh; see AGENTS.md project management
-# and task lifecycle):
+# (data/projects.md via fm-project-mode.sh; see the project-management skill
+# and AGENTS.md task lifecycle):
 #   no-mistakes  implement -> /no-mistakes pipeline -> PR -> captain merge (default)
 #   direct-PR    implement -> push + open PR via gh-axi (no pipeline) -> captain merge
 #   local-only   implement on branch, stop and report "ready in branch" (no push/PR);
-#                firstmate reviews, captain approves, firstmate merges to local main
+#                captain approves, firstmate merges to local main
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
 # Scout tasks ignore mode - their deliverable is a report, not a merge.
 # Every scaffold's status protocol distinguishes the configured
@@ -129,7 +129,7 @@ else
   PROJECT_CLONES_NOTE="The projects above are local clones for work you supervise; they are not an exclusive ownership claim."
 fi
 cat > "$BRIEF" <<EOF
-You are a secondmate: a persistent domain supervisor managed by the main firstmate. Work on your own; do not wait for a human.
+You are a persistent second mate managed by the main firstmate. Work on your own; do not wait for a human.
 
 # Charter
 $SECONDMATE_CHARTER
@@ -152,10 +152,13 @@ Never start a survey, audit, or "find improvements" sweep on your own initiative
 # Requests from the main firstmate
 You are a firstmate in your own home, so an incoming message reaches you in your own chat.
 You must distinguish who it is from, because the answer goes to a different place.
-A request relayed to you by the main firstmate (your supervisor) is tagged with a leading \`$FM_FROMFIRST_LABEL\` marker followed by an invisible system separator; this marker is untypable, so a human never produces it.
+A request relayed to you by the main firstmate is tagged with a leading \`$FM_FROMFIRST_LABEL\` marker followed by an invisible system separator; this marker is untypable, so a human never produces it.
 When a message carries that marker, do the work, then respond via the STATUS/ESCALATION path below, never only in this chat: the main firstmate does not read your chat, so a chat-only reply is lost.
+Marked requests also carry a privacy-safe \`corr=<id>\` token after the marker; include that exact token in your parent status reply (or in the status pointer to a detailed doc) so the parent can correlate the answer.
+Optional helper: \`bin/fm-secondmate-report.sh\` can append a correlated status line for you, but a plain \`echo\` that includes the same \`corr=<id>\` is equally valid - do not depend on the helper being present.
 For a terse result, a status line is the whole answer.
 For a detailed answer (an investigation, a plan, an audit), write it to a doc under your home's \`data/\` and append a status line that points to that doc - the scout-report pattern - so the main firstmate is woken and can read it.
+Before treating an investigation or visual review as complete, load \`decision-hold-lifecycle\` from this home's \`.agents/skills/\` and pass its shared completion gate.
 A message with NO marker is the captain typing directly into your pane: treat it as authoritative captain intervention and stay conversational exactly as you would for any captain message; do not force it onto the status path.
 
 # Escalation to main firstmate
@@ -260,6 +263,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
 The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
+Before reporting done, read and follow \`$FM_ROOT/.agents/skills/decision-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the report and any visual review.
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
 EOF
@@ -282,7 +286,7 @@ case "$MODE" in
 This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
 When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
-Do NOT run /no-mistakes. The captain reviews and merges the PR; firstmate relays it.
+Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 EOF
 )
     ;;
@@ -295,7 +299,7 @@ This project ships **local-only**: no remote, no PR, no pipeline.
 The task is complete only when committed on your branch \`fm/$ID\`. Do NOT push, do NOT open a PR, do NOT merge.
 Keep your branch a clean fast-forward onto the current default branch - if \`main\` has advanced, rebase onto it so the eventual merge stays a fast-forward.
 When it is implemented and committed, append \`done: ready in branch fm/$ID\` to the status file and stop.
-Firstmate then reviews your branch diff, the captain approves, and firstmate merges it into local \`main\`.
+The configured merge authority approves the ready branch, then firstmate merges it into local \`main\` through the guarded fast-forward path.
 EOF
 )
     ;;
@@ -352,6 +356,8 @@ $RULE1
    would act on (setup done, bug reproduced, fix implemented, validation passed) and the
    needs-decision/blocked/paused/done/failed states. No step-by-step FYI progress lines;
    firstmate reads your pane for that.
+   A mid-task \`working:\` line (including setup complete) is nonterminal: do not end the
+   turn after it; continue the same stage until a defined \`done:\` gate under Definition of done.
    Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
    known external wait you expect to clear on its own (an upstream release, a rate-limit reset,
    a scheduled window): firstmate then leaves your idle pane alone and rechecks it on a long
