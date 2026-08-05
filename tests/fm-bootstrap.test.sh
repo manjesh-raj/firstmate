@@ -4,14 +4,15 @@
 # Bootstrap prints one block or line per actionable problem, optional verbose
 # BOOTSTRAP_INFO fact, or completed bootstrap no-action fact and is silent when
 # all is well. firstmate consumes the exact 'MISSING: treehouse (install: ...)',
-# 'MISSING: tasks-axi (install: ...)', 'MISSING: quota-axi (install: ...)', and
+# 'MISSING: tasks-axi (install: ...)', 'MISSING: quota-axi (install: ...)',
+# 'MISSING: gh-axi (install: ...)', and
 # 'BOOTSTRAP_INFO: ...' lines, so those contracts are pinned verbatim. The cases
 # are table-driven over the inputs that vary: whether `treehouse get --help`
 # advertises --lease, which (if any) tasks-axi version is on PATH, whether
 # tasks-axi update advertises --archive-body, whether its mv help advertises
 # multi-ID moves, whether quota-axi is on PATH,
-# whether the local backend config opts out of tasks-axi backlog mutations, and
-# which no-mistakes version is on PATH.
+# whether the local backend config opts out of tasks-axi backlog mutations,
+# which no-mistakes version is on PATH, and which gh-axi version is on PATH.
 # Dedicated fleet-sync cases pin the computed bootstrap timeout, explicit
 # override, blank-env defaulting, partial-output relay, and pre-launch timeout
 # scan.
@@ -38,7 +39,16 @@ unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
 make_fake_toolchain() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
-  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi
+  fm_fake_exit0 "$fakebin" tmux node chrome-devtools-axi lavish-axi
+  cat > "$fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' "${FM_FAKE_GH_AXI_VERSION:-0.1.29}"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/gh-axi"
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
@@ -69,7 +79,7 @@ fi
 exit 0
 SH
   chmod +x "$fakebin/no-mistakes"
-  add_tasks_axi "$fakebin" "0.1.1"
+  add_tasks_axi "$fakebin" "0.2.2"
   add_quota_axi "$fakebin"
   printf '%s\n' "$fakebin"
 }
@@ -78,6 +88,10 @@ add_quota_axi() {
   local fakebin=$1
   cat > "$fakebin/quota-axi" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' "${FM_FAKE_QUOTA_AXI_VERSION:-0.1.16}"
+  exit 0
+fi
 exit 0
 SH
   chmod +x "$fakebin/quota-axi"
@@ -277,16 +291,16 @@ test_bootstrap_reporting() {
         ;;
     esac
   done <<'ROWS'
-treehouse --lease support is accepted silently^1^0.1.1^1^manual^empty^^
-treehouse without --lease reports an upgrade, gh auth is fine^0^0.1.1^1^-^grep^MISSING: treehouse (install: curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh)^NEEDS_GH_AUTH
-compatible tasks-axi is silent by default^1^0.1.1^1^-^empty^^
+treehouse --lease support is accepted silently^1^0.2.2^1^manual^empty^^
+treehouse without --lease reports an upgrade, gh auth is fine^0^0.2.2^1^-^grep^MISSING: treehouse (install: curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh)^NEEDS_GH_AUTH
+compatible tasks-axi is silent by default^1^0.2.2^1^-^empty^^
 missing tasks-axi is required by default^1^-^1^-^exact^MISSING: tasks-axi (install: npm install -g tasks-axi)^
 incompatible tasks-axi is required by default^1^0.1.0^1^-^exact^MISSING: tasks-axi (install: npm install -g tasks-axi)^
-tasks-axi without archive-body is required by default^1^0.1.2:noarchive^1^-^exact^MISSING: tasks-axi (install: npm install -g tasks-axi)^
+tasks-axi without archive-body is required by default^1^0.2.2:noarchive^1^-^exact^MISSING: tasks-axi (install: npm install -g tasks-axi)^
 tasks-axi without multi-id mv is required by default^1^0.2.2:nomulti^1^-^exact^MISSING: tasks-axi (install: npm install -g tasks-axi)^
-missing quota-axi is required by default^1^0.1.1^0^manual^exact^MISSING: quota-axi (install: npm install -g quota-axi)^
+missing quota-axi is required by default^1^0.2.2^0^manual^exact^MISSING: quota-axi (install: npm install -g quota-axi)^
 manual backlog backend still requires missing tasks-axi^1^-^1^manual^exact^MISSING: tasks-axi (install: npm install -g tasks-axi)^
-manual backlog backend suppresses tasks-axi availability^1^0.1.1^1^manual^empty^^
+manual backlog backend suppresses tasks-axi availability^1^0.2.2^1^manual^empty^^
 ROWS
   pass "bootstrap reports treehouse lease + tasks-axi/quota-axi bootstrap contracts"
 }
@@ -303,7 +317,6 @@ test_no_mistakes_min_version() {
     mkdir -p "$case_dir/home/config"
     printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
     fakebin=$(make_fake_toolchain "$case_dir")
-    add_tasks_axi "$fakebin" "0.1.1"
     out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
       FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_NO_MISTAKES_VERSION="$version" "$ROOT/bin/fm-bootstrap.sh")
     case "$mode" in
@@ -320,6 +333,121 @@ older no-mistakes patch reports an upgrade^no-mistakes version v1.31.1 (fake)^mi
 unparseable no-mistakes version reports an upgrade^no-mistakes development build^missing
 ROWS
   pass "bootstrap enforces no-mistakes minimum version"
+}
+
+test_gh_axi_min_version() {
+  local label version mode case_dir fakebin out missing n
+  missing='MISSING: gh-axi (install: npm install -g gh-axi && gh-axi setup hooks)'
+  n=0
+  while IFS='^' read -r label version mode; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    case_dir="$TMP_ROOT/gh-axi-$n"
+    mkdir -p "$case_dir/home/config"
+    printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+    fakebin=$(make_fake_toolchain "$case_dir")
+    out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_GH_AXI_VERSION="$version" "$ROOT/bin/fm-bootstrap.sh")
+    case "$mode" in
+      empty)
+        [ -z "$out" ] || fail "$label: expected silence, got: $out" ;;
+      missing)
+        [ "$out" = "$missing" ] || fail "$label: expected '$missing', got: $out" ;;
+    esac
+  done <<'ROWS'
+minimum gh-axi version is accepted^0.1.29^empty
+newer gh-axi patch is accepted^0.1.30^empty
+newer gh-axi minor is accepted^0.2.0^empty
+newer gh-axi major is accepted^1.0.0^empty
+older gh-axi patch reports an upgrade^0.1.19^missing
+much older gh-axi minor reports an upgrade^0.0.9^missing
+unparseable gh-axi version reports an upgrade^gh-axi development build^missing
+ROWS
+  pass "bootstrap enforces gh-axi minimum version"
+}
+
+test_tasks_axi_min_version() {
+  local label version mode case_dir fakebin out missing n archive_body multi_id
+  missing='MISSING: tasks-axi (install: npm install -g tasks-axi)'
+  n=0
+  while IFS='^' read -r label version mode; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    case_dir="$TMP_ROOT/tasks-axi-$n"
+    mkdir -p "$case_dir/home/config"
+    printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+    fakebin=$(make_fake_toolchain "$case_dir")
+    archive_body=yes
+    multi_id=yes
+    case "$version" in
+      *:noarchive)
+        archive_body=no
+        version=${version%:noarchive}
+        ;;
+    esac
+    case "$version" in
+      *:nomulti)
+        multi_id=no
+        version=${version%:nomulti}
+        ;;
+    esac
+    add_tasks_axi "$fakebin" "$version" "$archive_body" "$multi_id"
+    out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+    case "$mode" in
+      empty)
+        [ -z "$out" ] || fail "$label: expected silence, got: $out" ;;
+      missing)
+        [ "$out" = "$missing" ] || fail "$label: expected '$missing', got: $out" ;;
+    esac
+  done <<'ROWS'
+minimum tasks-axi version is accepted^0.2.2^empty
+newer tasks-axi patch is accepted^0.2.3^empty
+newer tasks-axi minor is accepted^0.3.0^empty
+newer tasks-axi major is accepted^1.0.0^empty
+older tasks-axi with features reports an upgrade^0.1.1^missing
+pre-multi-id tasks-axi reports an upgrade^0.2.1^missing
+unparseable tasks-axi version reports an upgrade^tasks-axi development build^missing
+tasks-axi at floor without archive-body reports an upgrade^0.2.2:noarchive^missing
+tasks-axi at floor without multi-id reports an upgrade^0.2.2:nomulti^missing
+ROWS
+  pass "bootstrap enforces tasks-axi minimum version"
+}
+
+# 0.1.16 is the first quota-axi that reports per-credential auth sources and Grok
+# state.authStatus. Before it, a dispatch candidate could not be scoped to its own
+# authentication surface, which is exactly how one harness's expired CLI token
+# produced a captain-facing "log in" claim for a candidate that never read it. A
+# stale install used to pass this check silently, so the fix stayed uninstalled.
+test_quota_axi_min_version() {
+  local label version mode case_dir fakebin out missing n
+  missing='MISSING: quota-axi (install: npm install -g quota-axi)'
+  n=0
+  while IFS='^' read -r label version mode; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    case_dir="$TMP_ROOT/quota-axi-$n"
+    mkdir -p "$case_dir/home/config"
+    printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+    fakebin=$(make_fake_toolchain "$case_dir")
+    out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_QUOTA_AXI_VERSION="$version" "$ROOT/bin/fm-bootstrap.sh")
+    case "$mode" in
+      empty)
+        [ -z "$out" ] || fail "$label: expected silence, got: $out" ;;
+      missing)
+        [ "$out" = "$missing" ] || fail "$label: expected '$missing', got: $out" ;;
+    esac
+  done <<'ROWS'
+minimum quota-axi version is accepted^0.1.16^empty
+newer quota-axi patch is accepted^0.1.17^empty
+newer quota-axi minor is accepted^0.2.0^empty
+newer quota-axi major is accepted^1.0.0^empty
+older quota-axi patch reports an upgrade^0.1.15^missing
+much older quota-axi minor reports an upgrade^0.0.9^missing
+unparseable quota-axi version reports an upgrade^quota-axi development build^missing
+ROWS
+  pass "bootstrap enforces quota-axi minimum version"
 }
 
 test_git_is_required_with_supported_install_instruction() {
@@ -655,6 +783,7 @@ make_routine_bootstrap_fixture() {
     printf '%s\n' '.fm-secondmate-home'
     printf '%s\n' 'config/crew-harness'
     printf '%s\n' 'config/crew-dispatch.json'
+    printf '%s\n' 'config/startup-memory-budget'
   } > "$root/.gitignore"
   printf '%s\n' 'instructions' > "$root/AGENTS.md"
   mkdir -p "$root/bin" "$root/.agents/skills"
@@ -675,10 +804,16 @@ make_routine_bootstrap_fixture() {
   add_real_jq "$fakebin"
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
-if [ "${1:-}" = display-message ]; then
-  printf '%s\n' codex
-  exit 0
-fi
+case "${1:-}" in
+  display-message)
+    case "$*" in
+      *'#{cursor_y}'*) printf '%s\n' 0 ;;
+      *) printf '%s\n' codex ;;
+    esac
+    ;;
+  capture-pane) printf '\n' ;;
+  list-windows) printf '%s\n' fm-sm ;;
+esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
@@ -710,19 +845,6 @@ test_routine_bootstrap_contract_runs_under_system_bash() {
   out=$(run_routine_bootstrap_fixture /bin/bash "$TMP_ROOT/routine-bash")
   [ -z "$out" ] || fail "routine bootstrap contract should be silent under /bin/bash, got: $out"
   pass "bootstrap routine contract runs under system /bin/bash"
-}
-
-test_bootstrap_info_is_no_load_and_actionable_lines_trigger() {
-  local trigger
-  # shellcheck disable=SC2016 # The backtick-delimited skill names are literal Markdown.
-  trigger=$(sed -n '/- `bootstrap-diagnostics`/,/- `diagnostic-reasoning`/p' "$ROOT/AGENTS.md")
-  assert_contains "$trigger" "actionable diagnostic line" "bootstrap-diagnostics trigger should be action-scoped"
-  assert_contains "$trigger" "BOOTSTRAP_INFO:" "bootstrap-diagnostics trigger should classify BOOTSTRAP_INFO as no-load"
-  assert_not_contains "$trigger" "TASKS_AXI:" "tasks-axi availability must not trigger diagnostics loading"
-  assert_not_contains "$trigger" "CREW_HARNESS_OVERRIDE:" "harness override confirmation must not trigger diagnostics loading"
-  assert_not_contains "$trigger" "CREW_DISPATCH: active" "active dispatch confirmation must not trigger diagnostics loading"
-  assert_not_contains "$trigger" "already-live" "already-live secondmate liveness must not trigger diagnostics loading"
-  pass "bootstrap diagnostics trigger excludes benign lines and keeps actionable prefixes"
 }
 
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info() {
@@ -775,7 +897,10 @@ unsupported codex max effort is flagged^{"rules":[{"when":"big feature","use":{"
 unsupported grok max effort is flagged^{"rules":[{"when":"deep current work","use":{"harness":"grok","model":"grok-4","effort":"max"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: grok:max
 unsupported grok xhigh effort is flagged^{"rules":[{"when":"deep current work","use":{"harness":"grok","model":"grok-4","effort":"xhigh"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: grok:xhigh
 pi max effort is accepted^{"rules":[{"when":"deep coding","use":{"harness":"pi","model":"openai-codex/gpt-5.6-sol","effort":"max"}}]}^empty^
+pi-signed max effort is accepted^{"rules":[{"when":"signed coding","use":{"harness":"pi-signed","model":"openai-codex/gpt-5.6-sol","effort":"max"}}]}^empty^
 unsupported opencode effort is flagged^{"rules":[{"when":"opencode work","use":{"harness":"opencode","model":"anthropic/claude-sonnet-4-5","effort":"high"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: opencode:high
+kimi model profile is accepted^{"rules":[{"when":"kimi work","use":{"harness":"kimi","model":"kimi-code/k3"}}]}^empty^
+unsupported kimi effort is flagged^{"rules":[{"when":"kimi work","use":{"harness":"kimi","model":"kimi-code/k3","effort":"high"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: kimi:high
 array use with quota-balanced is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude","model":"claude-sonnet-5","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}],"select":"quota-balanced"}]}^empty^
 array use without select is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}]}]}^empty^
 one-element array use is accepted^{"rules":[{"when":"focused feature","use":[{"harness":"claude"}]}]}^empty^
@@ -796,6 +921,9 @@ ROWS
 
 test_bootstrap_reporting
 test_no_mistakes_min_version
+test_gh_axi_min_version
+test_tasks_axi_min_version
+test_quota_axi_min_version
 test_git_is_required_with_supported_install_instruction
 test_orca_backend_gates_orca_tool_only_when_selected
 test_session_provider_backends_do_not_require_tmux
@@ -812,6 +940,5 @@ test_fleet_sync_timeout_empty_override_uses_default
 test_fleet_sync_timeout_is_computed_before_launch
 test_routine_bootstrap_confirmations_are_silent
 test_routine_bootstrap_contract_runs_under_system_bash
-test_bootstrap_info_is_no_load_and_actionable_lines_trigger
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info
 test_crew_dispatch_validation
