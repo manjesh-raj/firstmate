@@ -8,8 +8,12 @@
 #     ahead/behind counts against upstream.
 #   - A clean fast-forward (no local commits ahead) advances the default
 #     branch and pushes it to origin.
-#   - A diverged local branch (commits ahead of upstream) is refused, never
-#     auto-merged - matching prime directive #3 (unlanded work survives).
+#   - A local branch that is both ahead and behind (carries its own commits,
+#     as every real fork eventually does) is advanced with a real merge
+#     commit and pushed to origin - never a fast-forward, never --force.
+#   - A merge that cannot apply cleanly is aborted immediately, leaving the
+#     working tree exactly as it was - matching prime directive #3 (unlanded
+#     work survives).
 #   - A dirty working tree is refused, matching fm-update.sh's own guard.
 #   - The result is idempotent: a second run with nothing new reports
 #     already-current.
@@ -108,25 +112,57 @@ test_clean_fast_forward_pushes_to_origin() {
   pass "T2 clean fast-forward advances local and pushes to origin"
 }
 
-# --- T3: diverged local branch is refused, never auto-merged ----------------
-test_diverged_is_refused() {
-  local w out before
+# --- T3: local branch ahead AND behind is merged cleanly, then pushed -------
+test_ahead_and_behind_merges_cleanly() {
+  local w out
   w=$(new_world t3)
-  printf 'local-only work\n' >> "$w/main/AGENTS.md"
+  echo 'local-only work' > "$w/main/local-only.txt"
   git -C "$w/main" add -A
   git -C "$w/main" commit -qm local-work
-  before=$(git -C "$w/main" rev-parse HEAD)
   bump_upstream "$w"
 
   out=$(run_check "$w")
-  assert_contains "$out" "status: diverged" "check reports diverged, not would-update"
-  assert_contains "$out" "resolve manually" "diverged case explains no automatic merge"
+  assert_contains "$out" "status: would-merge" "check reports would-merge for an ahead+behind branch"
+  assert_contains "$out" "ahead: 1" "check reports the local commit count"
+  assert_contains "$out" "behind: 1" "check reports the upstream commit count"
 
   out=$(run_apply "$w")
-  assert_contains "$out" "status: skipped" "apply refuses a diverged branch"
+  assert_contains "$out" "status: merged" "apply reports a real merge"
+  [ "$(git -C "$w/main" rev-list --parents -n1 HEAD | wc -w | tr -d ' ')" -eq 3 ] \
+    || fail "advance is not a two-parent merge commit"
+  grep -q 'local-only work' "$w/main/local-only.txt" || fail "local commit's content did not survive the merge"
+  [ "$(git -C "$w/main" cat-file -e "$(git -C "$w/main" rev-parse upstream/main)" && echo ok)" = ok ] \
+    || fail "upstream commit is unreachable after merge"
+  git -C "$w/main" merge-base --is-ancestor upstream/main HEAD \
+    || fail "upstream/main is not an ancestor of the merged HEAD"
+  git clone -q "$w/origin.git" "$w/verify3" 2>/dev/null
+  [ "$(git -C "$w/verify3" rev-parse main)" = "$(git -C "$w/main" rev-parse HEAD)" ] \
+    || fail "merged commit was not pushed to origin"
+  pass "T3 an ahead+behind branch is merged with a real merge commit and pushed"
+}
+
+# --- T3b: a genuine conflict is aborted, working tree left untouched --------
+test_merge_conflict_is_aborted() {
+  local w out before
+  w=$(new_world t3b)
+  printf 'local-line\n' > "$w/main/conflict.txt"
+  git -C "$w/main" add -A
+  git -C "$w/main" commit -qm local-conflict
+  before=$(git -C "$w/main" rev-parse HEAD)
+
+  git -C "$w/seed" pull -q upstream main >/dev/null 2>&1 || git -C "$w/seed" pull -q origin main >/dev/null 2>&1
+  printf 'upstream-line\n' > "$w/seed/conflict.txt"
+  git -C "$w/seed" add -A
+  git -C "$w/seed" commit -qm upstream-conflict
+  git -C "$w/seed" push -q "$w/upstream.git" main 2>/dev/null || git -C "$w/seed" push -q upstream main
+
+  out=$(run_apply "$w")
+  assert_contains "$out" "status: merge-conflict" "apply reports a merge conflict"
   [ "$(git -C "$w/main" rev-parse HEAD)" = "$before" ] \
-    || fail "diverged local HEAD was moved (unlanded work at risk)"
-  pass "T3 diverged local branch is refused in both --check and apply modes"
+    || fail "conflicted merge left local HEAD moved"
+  [ -z "$(git -C "$w/main" status --porcelain)" ] || fail "conflicted merge left a dirty working tree"
+  [ ! -f "$w/main/.git/MERGE_HEAD" ] || fail "conflicted merge was not aborted"
+  pass "T3b a genuine conflict is aborted, leaving the working tree untouched"
 }
 
 # --- T4: dirty working tree is refused --------------------------------------
@@ -162,7 +198,8 @@ test_idempotent_already_current() {
 
 test_check_is_readonly
 test_clean_fast_forward_pushes_to_origin
-test_diverged_is_refused
+test_ahead_and_behind_merges_cleanly
+test_merge_conflict_is_aborted
 test_dirty_working_tree_is_refused
 test_idempotent_already_current
 
