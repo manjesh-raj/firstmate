@@ -880,7 +880,8 @@ test_bearings_request_returns_before_remote_delivery_and_supervision_sends_later
   rhome=$(cd "$rhome" && pwd -P)
   home=$(make_remote_parent_home remote-offpath remote-offpath-mate "$rhome" remote-offpath-host)
   jq -n --arg home "$rhome" '{
-    schema:"fm-secondmate-home-summary.v1",generated:"2026-09-01T22:00:00Z",generated_epoch:1900,home:$home,
+    schema:"fm-secondmate-home-summary.v1",hold_classifier_schema:"fm-captain-hold-buckets.v1",
+    generated:"2026-09-01T22:00:00Z",generated_epoch:1900,home:$home,
     valid:false,reason:"in-flight backlog item has no child metadata: stale-row",
     invalidity:{kind:"orphan_in_flight",ids:["stale-row"]},state:"no_active_work",
     active_children:[],decisions_open:[],holds:[],queued:[],landed:[],endpoints:[],
