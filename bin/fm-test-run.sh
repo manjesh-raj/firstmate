@@ -28,7 +28,11 @@
 #   fm-test-run.sh --aggregate-json <out.json> <lane.json> [more lane.json...]
 #
 # Options:
-#   --json <path>   write a deterministic timing artifact after the run
+#   --json <path>   write a deterministic timing artifact after the run. Each
+#                   script record carries its family, expected gate-skip class,
+#                   exit, duration, whether it gate-skipped, and the reason it
+#                   gave (empty when it ran), so a lane can say which harness or
+#                   tool this host could not exercise.
 #   --list          print selected script paths (one per line) and exit 0
 #   --list-scheduled
 #                   print selected paths longest-hint-first and exit 0
@@ -90,7 +94,13 @@
 # --fail-on-gate-skip token appears, the measured duration exceeds
 # --max-wall-ms, timing-artifact finalization fails, or a concurrent worker
 # violates its isolation check. Other gate skips (first meaningful line
-# matching ^skip:) remain successful and are counted as skipped_gate.
+# matching ^skip:) remain successful and are counted as skipped_gate; each one
+# is logged with its reason and recorded in the timing artifact.
+#
+# expected_gate_skip classes name why a family is allowed to skip: herdr (the
+# pinned real-Herdr lane), optional-binary (a backend whose binary is optional),
+# live-capability (a live-harness guard governed by fm_live_gate, which records
+# unavailable tools and explicit policy skips; see tests/lib.sh), or none.
 #
 # Family labels, the changed-file map, and production portable-shard composition
 # live in this script only (one owner). The proven-isolated candidate set remains
@@ -221,7 +231,7 @@ family_for_basename() {
     fm-composer-ghost.test.sh|fm-composer-lib.test.sh|\
     fm-crew-state.test.sh|fm-captain-hold-lifecycle.test.sh|\
     fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
-    fm-kimi-harness.test.sh|fm-muse-harness.test.sh|fm-rovo-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
+    fm-kimi-harness.test.sh|fm-muse-harness.test.sh|fm-rovo-harness.test.sh|fm-omp-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
     fm-lint-workflows.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
     fm-harness-adapter-references.test.sh|\
@@ -273,6 +283,7 @@ family_for_basename() {
       printf '%s\n' session-bootstrap
       ;;
     fm-afk-pi-herdr-return-e2e.test.sh|\
+    fm-bearings-board-lavish-live-e2e.test.sh|\
     fm-claude-stop-autoarm-live-e2e.test.sh|\
     fm-cmux-claude-composer-live-e2e.test.sh|\
     fm-composer-matrix-live-e2e.test.sh|\
@@ -284,7 +295,7 @@ family_for_basename() {
     fm-herdr-version-floor-live-e2e.test.sh|\
     fm-opencode-primary-live-e2e.test.sh|fm-pi-branch-live-e2e.test.sh|\
     fm-pi-branch-responsiveness-live-e2e.test.sh|\
-    fm-pi-primary-live-e2e.test.sh|\
+    fm-pi-primary-live-e2e.test.sh|fm-omp-primary-live-e2e.test.sh|\
     fm-sessionstart-hook-live-e2e.test.sh|fm-sessionstart-instruction-refresh-live-e2e.test.sh|\
     fm-quota-array-dispatch-live-e2e.test.sh|fm-send-secondmate-marker-herdr-e2e.test.sh|\
     fm-send-inbox-doorbell-live-e2e.test.sh|\
@@ -328,6 +339,7 @@ family_for_basename() {
     fm-no-mistakes-required.test.sh|fm-peek-remote.test.sh|\
     fm-pending-reply.test.sh|fm-pi-branch-extension.test.sh|\
     fm-procevent-quota.test.sh|fm-procevent-when.test.sh|fm-procevent.test.sh|\
+    fm-live-gate.test.sh|\
     fm-project-origin.test.sh|fm-public-followup.test.sh|fm-quota-choose.test.sh|\
     fm-remote-entrypoint.test.sh|fm-remote-secondmate-parent-binding.test.sh|\
     fm-send-remote-delivery.test.sh|fm-spawn-pool-base-freshen.test.sh|\
@@ -345,7 +357,7 @@ family_for_basename() {
 expected_gate_skip_for_family() {
   case "$1" in
     real-herdr-gated) printf '%s\n' herdr ;;
-    live-harness-optin) printf '%s\n' optin-env ;;
+    live-harness-optin) printf '%s\n' live-capability ;;
     cmux|zellij|orca) printf '%s\n' optional-binary ;;
     snapshot-bearings) printf '%s\n' optional-binary ;;
     *) printf '%s\n' none ;;
@@ -514,8 +526,8 @@ is_proven_isolated_script() {
 
 # The portable serial remainder: every tests/*.test.sh that is neither
 # proven-isolated nor real-herdr-gated. Watcher, lock, AFK, real tmux, daemon,
-# secondmate lifecycle, bootstrap, live-harness opt-in, GUI-backend, and other
-# unproven work stays here. Derived rather than enumerated so a newly added test
+# secondmate lifecycle, bootstrap, the live-harness-optin family, GUI-backend,
+# and other unproven work stays here. Derived rather than enumerated so a newly added test
 # lands here by default instead of falling out of every lane.
 list_portable_serial() {
   local s base fam
@@ -597,6 +609,7 @@ tests/fm-home-summary-refresh.test.sh 34793
 tests/fm-inactive-reconcile.test.sh 41826
 tests/fm-kimi-harness.test.sh 18015
 tests/fm-lint-workflows.test.sh 855
+tests/fm-live-gate.test.sh 6000
 tests/fm-muse-harness.test.sh 55572
 tests/fm-muse-signals-live-e2e.test.sh 23
 tests/fm-no-mistakes-required.test.sh 370
@@ -610,6 +623,7 @@ tests/fm-pi-branch-live-e2e.test.sh 56
 tests/fm-pi-branch-responsiveness-live-e2e.test.sh 21
 tests/fm-pi-primary-live-e2e.test.sh 20
 tests/fm-pi-watch-extension.test.sh 42970
+tests/fm-pi-windows-shell-invocation.test.sh 5121
 tests/fm-pr-check-security.test.sh 160475
 tests/fm-procevent-quota.test.sh 1949
 tests/fm-procevent-when.test.sh 17392
@@ -1262,6 +1276,7 @@ families_for_changed_path() {
     .pi/extensions/lib/fm-operational-input.ts)
       # The same rule for the operational-input library, whose reach is wider:
       # every Pi extension that classifies or encodes operational text.
+      printf '%s\n' __script__:fm-pi-windows-shell-invocation.test.sh
       printf '%s\n' __script__:fm-pi-branch-extension.test.sh
       printf '%s\n' __script__:fm-pi-watch-extension.test.sh
       printf '%s\n' __script__:fm-calm-pi-extension.test.sh
@@ -1275,6 +1290,7 @@ families_for_changed_path() {
     .pi/extensions/fm-primary-turnend-guard.ts)
       # The run tier's two harness-supplied facts (source vocabulary and
       # context-reset stdout injection) only show up against a real harness.
+      printf '%s\n' __script__:fm-pi-windows-shell-invocation.test.sh
       printf '%s\n' session-bootstrap
       printf '%s\n' live-harness-optin
       ;;
@@ -1374,7 +1390,7 @@ families_for_changed_path() {
     docs/fm-test-isolation-proof.json)
       printf '%s\n' pure-contract-unit
       ;;
-    .github/*|.tasks.toml|AGENTS.md|CLAUDE.md|CONTRIBUTING.md|\
+    .github/*|.gitattributes|.tasks.toml|AGENTS.md|CLAUDE.md|CONTRIBUTING.md|\
     docs/configuration.md|docs/supervision-protocols/*)
       printf '%s\n' pure-contract-unit
       ;;
@@ -1409,8 +1425,15 @@ families_for_changed_path() {
     README.md|LICENSE|assets/*|docs/*|.gitignore)
       ;;
     *)
-      families_for_test_reference "$path" \
-        || printf '%s\n' "__unmapped__:$path"
+      if [ -e "$path" ]; then
+        families_for_test_reference "$path" \
+          || printf '%s\n' "__unmapped__:$path"
+      else
+        # A retired source path with no remaining test consumer cannot select
+        # a runnable suite. Known source paths above retain their mappings,
+        # and a still-referenced removal is found by the same reference scan.
+        families_for_test_reference "$path" || true
+      fi
       ;;
   esac
 }
@@ -1486,6 +1509,17 @@ detect_gate_skip() {
   esac
 }
 
+# Echo the reason a gate skip gave, i.e. the first meaningful output line with
+# its leading "skip:" removed. Tabs and stray whitespace are folded so the
+# reason stays one field of the tab-separated record the JSON artifact is built
+# from. Callers only use this once detect_gate_skip has already said yes.
+gate_skip_reason() {
+  local file=$1 first
+  first=$(awk 'NF { print; exit }' "$file" 2>/dev/null || true)
+  first=${first#skip:}
+  printf '%s\n' "$first" | tr '\t' ' ' | sed -e 's/^ *//' -e 's/ *$//'
+}
+
 # True when any output line contains "skip: <token>" (token may contain spaces).
 detect_gate_skip_token() {
   local file=$1 token=$2
@@ -1539,7 +1573,7 @@ with open(records_file, encoding="utf-8") as fh:
         line = line.rstrip("\n")
         if not line:
             continue
-        path, family, expected, exit_s, dur_s, gate = line.split("\t")
+        path, family, expected, exit_s, dur_s, gate, reason = line.split("\t")
         scripts.append({
             "path": path,
             "family": family,
@@ -1547,6 +1581,7 @@ with open(records_file, encoding="utf-8") as fh:
             "duration_ms": int(dur_s),
             "exit": int(exit_s),
             "gate_skip": gate == "true",
+            "gate_skip_reason": reason,
         })
 
 families = []
@@ -2052,7 +2087,7 @@ family_bump() {
 
 record_script_result() {
   local script=$1 rc=$2 duration=$3 out=$4 end_iso=$5
-  local base family expected gate_skip fail_delta
+  local base family expected gate_skip gate_reason fail_delta
   base=$(basename "$script")
   family=$(family_for_basename "$base")
   expected=$(expected_gate_skip_for_family "$family")
@@ -2063,9 +2098,14 @@ record_script_result() {
   fi
 
   gate_skip=false
+  gate_reason=
   if [ "$rc" -eq 0 ] && detect_gate_skip "$out"; then
     gate_skip=true
+    gate_reason=$(gate_skip_reason "$out")
     SKIPPED_GATE=$((SKIPPED_GATE + 1))
+    # A capability skip is the runner's only record of what this host could not
+    # exercise, so name it rather than leaving a silent green.
+    log "gate skip: $script: ${gate_reason:-<no reason given>}"
   fi
 
   printf 'FM_TEST_END %s %s exit=%s duration_ms=%s gate_skip=%s\n' \
@@ -2078,8 +2118,8 @@ record_script_result() {
     AGG_RC=1
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$script" "$family" "$expected" "$rc" "$duration" "$gate_skip" >>"$RECORDS"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$script" "$family" "$expected" "$rc" "$duration" "$gate_skip" "$gate_reason" >>"$RECORDS"
   family_bump "$family" "$duration" "$fail_delta"
   TOTAL=$((TOTAL + 1))
 }
@@ -2155,10 +2195,19 @@ if [ "$JOBS" -eq 1 ]; then
   done
 else
   # Bounded concurrent execution for admitted scripts. Each worker gets a
-  # private mode-0700 TMPDIR so mktemp roots cannot collide. Retries are never
-  # used as a green strategy.
+  # private mode-0700 TMPDIR so mktemp roots cannot collide. Native Windows
+  # Bash layers report synthetic POSIX modes, so retain chmod there but enforce
+  # its observed mode only where the host reports real POSIX permissions.
+  # Retries are never used as a green strategy.
   worker_n=0
   active_workers=0
+
+  worker_root_mode_is_enforceable() {
+    case "$(uname -s)" in
+      MINGW*|MSYS*) return 1 ;;
+      *) return 0 ;;
+    esac
+  }
 
   wait_one_job_worker() {
     local slot=$1 pid idx work script rc duration mode out end_iso
@@ -2181,14 +2230,16 @@ else
     if [ -s "$out" ]; then
       cat "$out"
     fi
-    mode=$(stat -c %a "$work" 2>/dev/null || stat -f %Lp "$work" 2>/dev/null || echo unknown)
-    case "$mode" in
-      700|0700) ;;
-      *)
-        log "isolation failure: worker root mode is $mode, expected 0700 ($work)"
-        rc=1
-        ;;
-    esac
+    if worker_root_mode_is_enforceable; then
+      mode=$(stat -c %a "$work" 2>/dev/null || stat -f %Lp "$work" 2>/dev/null || echo unknown)
+      case "$mode" in
+        700|0700) ;;
+        *)
+          log "isolation failure: worker root mode is $mode, expected 0700 ($work)"
+          rc=1
+          ;;
+      esac
+    fi
     record_script_result "$script" "$rc" "$duration" "$out" "$end_iso"
   }
 
