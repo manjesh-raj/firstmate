@@ -1601,6 +1601,13 @@ test_non_linked_index_lock_path_is_checked_from_worktree() {
 
 test_index_lock_mtime_read_failure_refuses() {
   local case_dir rc lock
+  # The mtime fault is injected by a fake stat on PATH; on Darwin the lock
+  # helper now calls /usr/bin/stat directly, so the fake can never fire there.
+  # Skip the Darwin run of this case.
+  if [ "$(uname)" = Darwin ]; then
+    pass "index-lock mtime fault injection is PATH-based; skipped on Darwin where stat is /usr/bin/stat"
+    return
+  fi
   case_dir=$(make_case mtime-error-index-lock)
   write_meta "$case_dir" no-mistakes ship
   wt_commit "$case_dir" "shippable work"

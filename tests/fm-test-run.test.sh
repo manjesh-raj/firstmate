@@ -163,6 +163,69 @@ init_changed_fixture_repo() {
   git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm baseline
 }
 
+# Build a repository with a primary checkout and one linked worktree, each
+# holding a runnable copy of the runner and a probe suite that records the fact
+# that it ran. Untracked copies are enough: the runner resolves its root from
+# its own path, and the probe is named explicitly.
+init_primary_and_linked_worktree() {
+  local repo=$1 linked=$2 tree
+  fm_git_init_commit "$repo"
+  git -C "$repo" worktree add --quiet -b linked-probe "$linked"
+  for tree in "$repo" "$linked"; do
+    mkdir -p "$tree/bin" "$tree/tests"
+    cp "$RUNNER" "$tree/bin/fm-test-run.sh"
+    chmod +x "$tree/bin/fm-test-run.sh"
+    cat >"$tree/tests/probe.test.sh" <<PROBE
+#!/usr/bin/env bash
+echo "ok - probe suite"
+: >"$tree/ran"
+PROBE
+    chmod +x "$tree/tests/probe.test.sh"
+  done
+}
+
+# A task worker's isolated placement is checked once, when the task starts.
+# Nothing re-checks it, so a worker that later changes directory into the
+# repository's primary checkout would run this branch-switching suite in the one
+# checkout every linked worktree resolves against. The runner refuses that.
+test_task_marker_refuses_the_primary_checkout() {
+  local tmp repo linked out rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-primary.XXXXXX")
+  repo="$tmp/repo"
+  linked="$tmp/linked"
+  init_primary_and_linked_worktree "$repo" "$linked"
+
+  # Marker set, primary checkout: refuse, name the primary, and run nothing.
+  out=$(FM_TASK_ID=probe-task "$repo/bin/fm-test-run.sh" tests/probe.test.sh 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || { rm -rf "$tmp"; fail "the runner must refuse the primary checkout under a task marker"; }
+  assert_contains "$out" "primary checkout" "refusal did not name the primary checkout"
+  assert_contains "$out" "FM_TASK_ID=probe-task" "refusal did not name the task marker"
+  assert_contains "$out" "task worktree" "refusal did not point at the task worktree"
+  assert_not_contains "$out" "FM_TEST_BEGIN" "the refusal must happen before any suite runs"
+  assert_absent "$repo/ran" "the refused run still executed a suite"
+
+  # Marker set, linked worktree: the assigned placement, so the suite runs.
+  FM_TASK_ID=probe-task "$linked/bin/fm-test-run.sh" tests/probe.test.sh >/dev/null 2>&1 \
+    || { rm -rf "$tmp"; fail "the runner must still run in a linked task worktree"; }
+  assert_present "$linked/ran" "the linked-worktree run did not execute its suite"
+
+  # No marker: a person in their own checkout is unaffected.
+  "$repo/bin/fm-test-run.sh" tests/probe.test.sh >/dev/null 2>&1 \
+    || { rm -rf "$tmp"; fail "an unmarked run in the primary checkout must be unchanged"; }
+  assert_present "$repo/ran" "the unmarked run did not execute its suite"
+
+  # Inspection executes nothing, so it stays available even in the primary.
+  rm -f "$repo/ran"
+  out=$(FM_TASK_ID=probe-task "$repo/bin/fm-test-run.sh" --list tests/probe.test.sh 2>&1) \
+    || { rm -rf "$tmp"; fail "--list must remain available under a task marker"; }
+  [ "$out" = "tests/probe.test.sh" ] \
+    || { rm -rf "$tmp"; fail "--list under a task marker printed: $out"; }
+  assert_absent "$repo/ran" "--list must not execute a suite"
+
+  rm -rf "$tmp"
+  pass "a task marker refuses execution in the primary checkout and leaves worktrees and inspection alone"
+}
+
 test_changed_runner_surfaces_select_their_family() {
   local tmp repo listed
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-owner-scope.XXXXXX")
@@ -1521,6 +1584,7 @@ test_list_all_exact_suite_coverage
 test_family_selection
 test_single_script_selection
 test_changed_file_selection_is_conservative
+test_task_marker_refuses_the_primary_checkout
 test_changed_runner_surfaces_select_their_family
 test_shell_line_ending_policy_selects_runner_contract
 test_changed_dependency_selection_and_unmapped_failure

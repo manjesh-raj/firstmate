@@ -182,6 +182,12 @@
 #   itself a linked worktree of the project repository still launches. A pane
 #   that never reaches an isolated worktree refuses at the end of that wait,
 #   naming the last path seen and why it was rejected.
+#   That placement is proven only at launch. Every ship or scout pane therefore
+#   also receives `export FM_TASK_ID=<task-id>` before the launch command, on
+#   the same channel as GOTMPDIR, and bin/fm-test-run.sh refuses to execute the
+#   behavior suite from the repository primary checkout while that marker is
+#   set (its header owns the refusal). A secondmate runs in its own home and is
+#   not marked.
 #   Only after this isolation check, every fresh ship or scout requires a clean
 #   task worktree. When an origin configuration is detected, spawn fetches it,
 #   resolves the current remote default branch, and resets to its tip. When none
@@ -224,7 +230,8 @@
 #   LANG LC_ALL LC_CTYPE TMPDIR TMP TEMP GOTMPDIR, plus backend identity/routing:
 #   TMUX TMUX_PANE HERDR_ENV HERDR_SESSION HERDR_SOCKET_PATH HERDR_PANE_ID
 #   CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_TAB_ID CMUX_PANEL_ID CMUX_SOCKET_PATH
-#   ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID FM_ZELLIJ_SESSION.
+#   ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID FM_ZELLIJ_SESSION, plus the task
+#   marker FM_TASK_ID that ship and scout panes receive above.
 #   An enabled task trace also retains TRACEPARENT. Explicit Firstmate launch
 #   assignments still apply inside the filtered environment. Raw commands must
 #   be POSIX sh compatible under this opt-in; the absent-file path is unchanged.
@@ -282,6 +289,11 @@
 # and every refusal; a failed registration stops this spawn rather than launching
 # a worker that would wedge on the dialog. A --secondmate launch never runs it,
 # so a claude secondmate home keeps its own one-time trust decision.
+# Every claude launch also carries the attribution-off policy in its per-launch
+# --settings JSON, so a spawned worker never writes a Co-Authored-By trailer,
+# Claude-Session link, or generated-with line into a commit or PR body;
+# launch_template() below owns the reason it cannot come from the captain's own
+# settings.
 # Publishing the record and moving this home's backlog item to In flight are one
 # step, not two: bin/fm-backlog-transition-lib.sh owns that invariant, and this
 # script performs the transition under the task's own meta lock before it reports
@@ -1408,7 +1420,15 @@ launch_template() {
     # alone disables the feature; keep both so a managed override of one still
     # leaves the other in force. Both are per-launch, scoped to this invocation only,
     # and never touch the captain's global ~/.claude/settings.json.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude --dangerously-skip-permissions --settings '\''{"feedbackDrafts":"off"}'\'' __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    # The same inline --settings JSON also carries the attribution policy
+    # ("attribution": {"commit": "", "pr": "", "sessionUrl": false}), which
+    # suppresses Claude Code's Co-Authored-By trailer, Claude-Session link, and
+    # generated-with line in commits and PR bodies. The captain sets that
+    # policy in the `user` settings scope, but a launched worker's settings
+    # sources are not guaranteed to load that scope, so a worker would
+    # otherwise run with attribution back on; carrying it per launch keeps the
+    # policy in force regardless of which settings scopes end up loaded.
+    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude --dangerously-skip-permissions --settings '\''{"feedbackDrafts":"off","attribution":{"commit":"","pr":"","sessionUrl":false}}'\'' __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
@@ -3796,6 +3816,14 @@ spawn_record_traceparent() {
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+# Mark the pane as a task worker so bin/fm-test-run.sh can refuse to run the
+# suite in the repository's primary checkout. Ship and scout workers are the
+# ones assigned an isolated worktree; a secondmate runs its own home instead.
+# The id reached a validated bare-slug charset above, so it carries no shell
+# syntax of its own.
+if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
+  spawn_send_text_line "$T" "export FM_TASK_ID=$ID"
+fi
 # Send through the exact channel that already ships GOTMPDIR, so every backend
 # and harness - ship, scout, and secondmate - gets it before launch. Skipped
 # entirely when trace context is off.
@@ -3819,6 +3847,7 @@ if [ "$LAUNCH_ENV_ENABLED" = 1 ]; then
     TMPDIR TMP TEMP GOTMPDIR TMUX TMUX_PANE HERDR_ENV HERDR_SESSION HERDR_SOCKET_PATH \
     HERDR_PANE_ID CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_TAB_ID CMUX_PANEL_ID \
     CMUX_SOCKET_PATH ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID FM_ZELLIJ_SESSION \
+    FM_TASK_ID \
     $LAUNCH_ENV_NAMES; do
     # Only validated names enter shell syntax. Values expand once, quoted, in
     # the pane shell and never become source text or spawn-process snapshots.

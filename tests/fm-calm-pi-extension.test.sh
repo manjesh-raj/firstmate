@@ -71,6 +71,82 @@ find_chrome() {
   return 1
 }
 
+# Render an exported session in real Chrome and leave the DOM in <out_file>.
+#
+# Rendering is a vendor-tool step, not a Calm guarantee: the DOM assertions the
+# caller runs afterwards are what protect the contract. Headless Chrome start-up
+# is the part that fails intermittently on a loaded CI runner - it can exit
+# before writing any DOM at all - and the original single unattended attempt
+# discarded both Chrome's stderr and its exit status, so a CI break surfaced as
+# a bare "could not render" with nothing in the log to tell a Chrome start-up
+# crash apart from a real change in Pi's export shape.
+#
+# So: retry the render a bounded number of times on a fresh profile, and when
+# every attempt fails, print the Chrome binary, its version, the installed Pi
+# version, and each attempt's exit status, stderr tail, and whether the helper
+# timed the attempt out - when it did, the exit status is only this helper's own
+# kill signal. The extra flags remove Chrome's background-network and /dev/shm
+# dependencies, which are the start-up surfaces that fail on a runner; neither
+# changes the rendered DOM of a local file.
+render_export_dom() {
+  local chrome=$1 source_file=$2 out_file=$3 pi_version=$4
+  local attempt pid status wait_count wait_limit reap_wait log profile report timed_out
+  report="$TMP_ROOT/chrome-render-report.txt"
+  wait_limit=${FM_CHROME_RENDER_WAIT_TICKS:-300}
+  : >"$report"
+  for attempt in 1 2 3; do
+    log="$TMP_ROOT/chrome-render-$attempt.err"
+    profile="$TMP_ROOT/chrome-profile-$attempt"
+    rm -rf "$profile"
+    : >"$out_file"
+    "$chrome" \
+      --headless=new \
+      --disable-gpu \
+      --no-sandbox \
+      --disable-dev-shm-usage \
+      --disable-background-networking \
+      --user-data-dir="$profile" \
+      --virtual-time-budget=2000 \
+      --dump-dom \
+      "file://$source_file" >"$out_file" 2>"$log" &
+    pid=$!
+    # Check the DOM before Chrome's liveness, so an attempt that writes the
+    # complete dump and exits immediately is still read as a success.
+    wait_count=0
+    while [ "$wait_count" -lt "$wait_limit" ]; do
+      grep -Fq '</html>' "$out_file" 2>/dev/null && break
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+      wait_count=$((wait_count + 1))
+    done
+    timed_out=no
+    if [ "$wait_count" -ge "$wait_limit" ]; then
+      timed_out=yes
+    fi
+    kill "$pid" 2>/dev/null || true
+    # Chrome can retain --headless=new after --dump-dom completes and ignore TERM,
+    # so an unbounded wait can hang after the complete DOM has been captured.
+    reap_wait=0
+    while kill -0 "$pid" 2>/dev/null && [ "$reap_wait" -lt 20 ]; do
+      sleep 0.1
+      reap_wait=$((reap_wait + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    status=0
+    wait "$pid" 2>/dev/null || status=$?
+    grep -Fq '</html>' "$out_file" 2>/dev/null && return 0
+    printf 'attempt %s: exit=%s timed_out=%s bytes=%s stderr=%s\n' \
+      "$attempt" "$status" "$timed_out" "$(wc -c <"$out_file" | tr -d ' ')" \
+      "$(tail -c 400 "$log" 2>/dev/null | tr '\n' ' ')" >>"$report"
+  done
+  printf 'chrome=%s chrome_version=%s pi=%s; %s' \
+    "$chrome" "$("$chrome" --version 2>&1 | head -1)" "$pi_version" \
+    "$(tr '\n' ' ' <"$report")"
+  return 1
+}
+
 test_home_resolution() {
   local fixture out status version
   if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
@@ -3107,8 +3183,105 @@ JS
   pass "Pi Calm working ship moves on a slow independent cadence over faster fixed-cell blue water, paints the complete boat standard yellow with balanced resets, keeps ANSI-stripped width exact, flips the directional sail on the exact bounce at both edges and every width, clamps visible and hidden resizes, falls back deterministically when narrow, freezes and resumes column/direction across settle/start without hidden-time jumps or duplicate timers, resets only on a fresh session, and installs and removes one scheduler-owning widget across starts, settle, abort, failure, shutdown, reload, replacement, and Calm toggles while leaving Calm-off visibility untouched"
 }
 
+# The rendered-DOM assertions below depend on a real browser, so the render step
+# itself is the part that fails for reasons that have nothing to do with Calm.
+# This pins that guard with real processes and no browser: one clean render, one
+# that only succeeds after Chrome's start-up flake, and one that never renders
+# and must report enough to tell a Chrome failure apart from a Pi export change.
+test_export_dom_render_guard() {
+  local dir source_file out_file report
+
+  dir="$TMP_ROOT/render-guard"
+  mkdir -p "$dir"
+  source_file="$dir/export.html"
+  out_file="$dir/dom.html"
+  printf '<html><body>export</body></html>\n' >"$source_file"
+
+  cat >"$dir/chrome-ok" <<'SH'
+#!/bin/sh
+case "${1:-}" in --version) echo "FakeChrome 1.2.3"; exit 0 ;; esac
+echo attempt >>"$FM_FAKE_CHROME_ATTEMPTS"
+printf '<html><head></head><body>export</body></html>\n'
+SH
+  cat >"$dir/chrome-flaky" <<'SH'
+#!/bin/sh
+case "${1:-}" in --version) echo "FakeChrome 1.2.3"; exit 0 ;; esac
+echo attempt >>"$FM_FAKE_CHROME_ATTEMPTS"
+if [ "$(wc -l <"$FM_FAKE_CHROME_ATTEMPTS")" -lt 3 ]; then
+  echo "fake chrome start-up crashed" >&2
+  exit 1
+fi
+printf '<html><head></head><body>export</body></html>\n'
+SH
+  cat >"$dir/chrome-broken" <<'SH'
+#!/bin/sh
+case "${1:-}" in --version) echo "FakeChrome 1.2.3"; exit 0 ;; esac
+echo attempt >>"$FM_FAKE_CHROME_ATTEMPTS"
+echo "FAKE_CHROME_STARTUP_MARKER" >&2
+exit 9
+SH
+  cat >"$dir/chrome-hang" <<'SH'
+#!/bin/sh
+case "${1:-}" in --version) echo "FakeChrome 1.2.3"; exit 0 ;; esac
+echo attempt >>"$FM_FAKE_CHROME_ATTEMPTS"
+printf '<html><head></head><body>export'
+exec sleep 30
+SH
+  chmod +x "$dir/chrome-ok" "$dir/chrome-flaky" "$dir/chrome-broken" "$dir/chrome-hang"
+
+  : >"$dir/attempts-ok"
+  FM_FAKE_CHROME_ATTEMPTS="$dir/attempts-ok" \
+    render_export_dom "$dir/chrome-ok" "$source_file" "$out_file" 9.9.9 >"$dir/report-ok" \
+    || fail "render_export_dom rejected a Chrome that dumped a complete DOM"
+  grep -Fq '</html>' "$out_file" || fail "render_export_dom did not leave the rendered DOM behind"
+  [ "$(wc -l <"$dir/attempts-ok")" -eq 1 ] \
+    || fail "render_export_dom retried a Chrome that had already rendered the DOM"
+  [ ! -s "$dir/report-ok" ] || fail "render_export_dom reported a diagnostic for a successful render"
+
+  : >"$dir/attempts-flaky"
+  : >"$out_file"
+  FM_FAKE_CHROME_ATTEMPTS="$dir/attempts-flaky" \
+    render_export_dom "$dir/chrome-flaky" "$source_file" "$out_file" 9.9.9 >"$dir/report-flaky" \
+    || fail "render_export_dom gave up on a Chrome that renders after a start-up failure"
+  grep -Fq '</html>' "$out_file" || fail "a retried render left no DOM behind"
+  [ "$(wc -l <"$dir/attempts-flaky")" -eq 3 ] \
+    || fail "render_export_dom did not retry the failed Chrome start-ups exactly"
+
+  : >"$dir/attempts-broken"
+  : >"$out_file"
+  if FM_FAKE_CHROME_ATTEMPTS="$dir/attempts-broken" \
+    render_export_dom "$dir/chrome-broken" "$source_file" "$out_file" 9.9.9 >"$dir/report-broken"
+  then
+    fail "render_export_dom accepted a Chrome that never rendered the DOM"
+  fi
+  [ "$(wc -l <"$dir/attempts-broken")" -eq 3 ] \
+    || fail "render_export_dom did not exhaust its bounded retries before failing"
+  report=$(cat "$dir/report-broken")
+  assert_contains "$report" "$dir/chrome-broken" "the render failure did not name the Chrome binary it used"
+  assert_contains "$report" "FakeChrome 1.2.3" "the render failure did not name the Chrome version it used"
+  assert_contains "$report" "pi=9.9.9" "the render failure did not name the installed Pi version"
+  assert_contains "$report" "exit=9" "the render failure did not report Chrome's exit status"
+  assert_contains "$report" "timed_out=no" "the render failure did not report that Chrome exited on its own"
+  assert_contains "$report" "FAKE_CHROME_STARTUP_MARKER" "the render failure discarded Chrome's own diagnostic"
+
+  : >"$dir/attempts-hang"
+  : >"$out_file"
+  if FM_FAKE_CHROME_ATTEMPTS="$dir/attempts-hang" FM_CHROME_RENDER_WAIT_TICKS=3 \
+    render_export_dom "$dir/chrome-hang" "$source_file" "$out_file" 9.9.9 >"$dir/report-hang"
+  then
+    fail "render_export_dom accepted a Chrome that never finished the DOM"
+  fi
+  [ "$(wc -l <"$dir/attempts-hang")" -eq 3 ] \
+    || fail "render_export_dom did not exhaust its bounded retries on a Chrome that never finished"
+  report=$(cat "$dir/report-hang")
+  assert_contains "$report" "timed_out=yes" \
+    "the render failure reported its own kill signal without saying the attempt was timed out"
+
+  pass "the rendered-export-DOM guard renders in one pass, retries a bounded number of Chrome start-up failures, and reports the Chrome binary, Chrome version, Pi version, exit status, and Chrome diagnostic when every attempt fails"
+}
+
 test_interactive_terminal_e2e() {
-  local project config home session_file export_file export_dom default_snapshot expanded_snapshot hidden_snapshot active_before_snapshot active_hidden_snapshot export_snapshot export_settled_snapshot restored_snapshot working_snapshot working_response_snapshot restarted_snapshot resumed_restored_snapshot hash_before hash_after now version chrome chrome_pid chrome_wait chrome_reap_wait active_wait active_screen_wait boat_frame_one boat_frame_two boat_resized_snapshot boat_focus_snapshot boat_cleared_snapshot boat_hull_line boat_sail_line boat_column_one boat_column_two boat_line boat_color_snapshot boat_color_line boat_water_snapshot boat_water_line boat_water_first boat_water_changed boat_narrow_snapshot boat_narrow_sails boat_freeze_snapshot boat_resume_snapshot boat_freeze_column boat_freeze_sail boat_resume_column boat_resume_sail
+  local project config home session_file export_file export_dom default_snapshot expanded_snapshot hidden_snapshot active_before_snapshot active_hidden_snapshot export_snapshot export_settled_snapshot restored_snapshot working_snapshot working_response_snapshot restarted_snapshot resumed_restored_snapshot hash_before hash_after now version chrome chrome_report active_wait active_screen_wait boat_frame_one boat_frame_two boat_resized_snapshot boat_focus_snapshot boat_cleared_snapshot boat_hull_line boat_sail_line boat_column_one boat_column_two boat_line boat_color_snapshot boat_color_line boat_water_snapshot boat_water_line boat_water_first boat_water_changed boat_narrow_snapshot boat_narrow_sails boat_freeze_snapshot boat_resume_snapshot boat_freeze_column boat_freeze_sail boat_resume_column boat_resume_sail
   if ! command -v pi >/dev/null 2>&1 || ! command -v tmux >/dev/null 2>&1; then
     echo "skip: pi or tmux not found for Pi calm interactive E2E"
     return 0
@@ -3554,36 +3727,10 @@ if (!serialized.includes("firstmate-synthetic-input") || !serialized.includes("/
 const synthetic = entries.find((entry) => entry.type === "custom_message" && entry.customType === "firstmate-synthetic-input");
 if (!synthetic || synthetic.display) process.exit(1);
 JS
-  chrome=$(find_chrome) || fail "Chrome or Chromium is required for rendered export DOM assertions"
-  "$chrome" \
-    --headless=new \
-    --disable-gpu \
-    --no-sandbox \
-    --user-data-dir="$TMP_ROOT/chrome-profile" \
-    --virtual-time-budget=2000 \
-    --dump-dom \
-    "file://$export_file" >"$export_dom" 2>/dev/null &
-  chrome_pid=$!
-  chrome_wait=0
-  while kill -0 "$chrome_pid" 2>/dev/null && [ "$chrome_wait" -lt 100 ]; do
-    grep -Fq '</html>' "$export_dom" 2>/dev/null && break
-    sleep 0.1
-    chrome_wait=$((chrome_wait + 1))
-  done
-  kill "$chrome_pid" 2>/dev/null || true
-  # Chrome can retain --headless=new after --dump-dom completes and ignore TERM,
-  # so an unbounded wait can hang after the complete DOM has been captured.
-  chrome_reap_wait=0
-  while kill -0 "$chrome_pid" 2>/dev/null && [ "$chrome_reap_wait" -lt 20 ]; do
-    sleep 0.1
-    chrome_reap_wait=$((chrome_reap_wait + 1))
-  done
-  if kill -0 "$chrome_pid" 2>/dev/null; then
-    kill -9 "$chrome_pid" 2>/dev/null || true
-  fi
-  wait "$chrome_pid" 2>/dev/null || true
-  grep -Fq '</html>' "$export_dom" 2>/dev/null \
-    || fail "could not render calm-mode HTML export DOM"
+  chrome=$(find_chrome) \
+    || fail "Chrome or Chromium is required for rendered export DOM assertions; set FM_CHROME_BIN to one"
+  chrome_report=$(render_export_dom "$chrome" "$export_file" "$export_dom" "$version") \
+    || fail "could not render calm-mode HTML export DOM: $chrome_report"
   node - "$export_dom" <<'JS' || fail "rendered export DOM violated the Calm conversation boundary"
 const dom = require("node:fs").readFileSync(process.argv[2], "utf8");
 const messages = dom.match(/<div id="messages">([\s\S]*?)<\/main>/)?.[1];
@@ -4017,4 +4164,5 @@ test_calm_mid_turn_working_notes
 test_operational_followup_turn_e2e
 test_hidden_block_geometry_e2e
 test_working_ship_geometry_and_lifecycle
+test_export_dom_render_guard
 test_interactive_terminal_e2e
