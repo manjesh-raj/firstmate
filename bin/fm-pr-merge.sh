@@ -11,7 +11,9 @@
 # A GitHub merge is refused unless every pre-merge condition holds, each read
 # live at merge time rather than taken from recorded metadata: the pull request
 # is open, not a draft, mergeable, free of conflicts, and every unwaived check
-# is green at the exact current head commit. Every failing condition is reported, not
+# is green at the exact current head commit, where github_checks_not_green below
+# owns what makes a check green and judges each one by its current run.
+# Every failing condition is reported, not
 # just the first. The verified head is then passed to gh as
 # --match-head-commit, so a push that lands between that read and the merge
 # fails the merge instead of landing commits nothing verified. Reading that
@@ -71,8 +73,10 @@
 # held for the captain return. An unreadable record refuses rather than being
 # skipped. Neither posture releases a captain hold, and the grant lapses when
 # the record is archived.
-# The lock ends when the local forge command returns; docs/captain-hold-lifecycle.md owns
-# the accepted asynchronous-landing and merge-to-cleanup residuals.
+# A failed forge command releases the lock after it returns. A successful one
+# retains the lock until the accepted merge authority is persisted against the
+# still-matching task metadata; docs/captain-hold-lifecycle.md owns the accepted
+# asynchronous-landing and merge-to-cleanup residuals.
 #
 # Extra args must not include --repo or -R in any form, including a bundled
 # short-option cluster such as -yR, because the repository comes only from the
@@ -107,6 +111,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
 # shellcheck source=bin/fm-merge-outcome-lib.sh
 . "$SCRIPT_DIR/fm-merge-outcome-lib.sh"
+# shellcheck source=bin/fm-merge-authority-lib.sh
+. "$SCRIPT_DIR/fm-merge-authority-lib.sh"
 # shellcheck source=bin/fm-afk-contract.sh
 . "$SCRIPT_DIR/fm-afk-contract.sh"
 
@@ -122,6 +128,8 @@ if ! fm_pr_task_id_valid "$ID" || ! fm_pr_url_parse "$RAW_URL"; then
 fi
 URL=$FM_PR_URL
 PROVIDER=$FM_PR_PROVIDER
+PR_HOST=$FM_PR_HOST
+PR_PATH=$FM_PR_PATH
 PR_OWNER=$FM_PR_OWNER
 PR_REPO=$FM_PR_REPO
 PR_NUMBER=$FM_PR_NUMBER
@@ -293,7 +301,9 @@ fi
 MERGE_EXPECTED_SPAWN_GEN=$FM_BACKLOG_META_SPAWN_GEN
 
 MERGE_CONTROL_LOCK=
+MERGE_META_LOCK=
 merge_control_cleanup() {
+  [ -z "$MERGE_META_LOCK" ] || fm_lock_release "$MERGE_META_LOCK" || true
   [ -z "$MERGE_CONTROL_LOCK" ] || fm_lock_release "$MERGE_CONTROL_LOCK" || true
 }
 trap merge_control_cleanup EXIT
@@ -443,22 +453,80 @@ FIELDS
 }
 
 # Every GitHub check that is not green in the given live pull-request JSON, one
-# name per line: a status context whose state is not SUCCESS, or a check run
-# that has not completed with SUCCESS, NEUTRAL, or SKIPPED (so a pending
-# check is not green either). Exits nonzero when the rollup cannot be read, so
-# a malformed answer is a failed read and never an empty red set.
+# name per line. An entry is green when it is a status context whose state is
+# SUCCESS, or a check run that completed with SUCCESS, NEUTRAL, or SKIPPED (so
+# a pending check is not green either). Exits nonzero when the rollup cannot be
+# read, so a malformed answer is a failed read and never an empty red set.
+#
+# The rollup can hold several runs of one check name at the same head, because
+# GitHub cancels a pull request's in-flight run when the base branch advances
+# and re-triggers it; the cancelled run stays in the rollup beside the passing
+# re-run. A check is therefore judged by its current run rather than by any run
+# that a later one superseded, which is what makes this agree with GitHub's own
+# CLEAN mergeStateStatus instead of refusing a pull request GitHub considers
+# mergeable.
+#
+# Supersession applies only among check runs with the same reported name. A
+# name is dropped from the red set only when every non-green run is COMPLETED,
+# has a whole-second UTC startedAt, and started strictly before a green run.
+# Status contexts are never grouped or superseded, and every non-green one is
+# reported independently. A still-running, queued, undated, or tied check run
+# stays red. A name whose runs are all green needs no timestamp, while a name
+# with no green run stays red.
+#
+# The reported name is also what --allow-red matches. An unnamed check run is
+# grouped alone and can neither supersede nor be superseded, because unrelated
+# unnamed checks must not be treated as one.
 github_checks_not_green() {
   local json=$1
   printf '%s' "$json" | jq -r '
+    def settled_at:
+      if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+      then . else null end;
     if (.statusCheckRollup | type) != "array" then error("no check rollup") else . end
-    | .statusCheckRollup[]
-    | if .__typename == "CheckRun" then
-        {name: (.name // ""), ok: (.status == "COMPLETED" and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED"))}
-      else
-        {name: (.context // ""), ok: (.state == "SUCCESS")}
-      end
-    | select(.ok | not)
-    | if .name == "" then "(unnamed check)" else .name end
+    | [ .statusCheckRollup
+        | to_entries[]
+        | .key as $i
+        | .value
+        | if .__typename == "CheckRun" then
+            {
+              kind: "check_run",
+              name: (.name // ""),
+              completed: (.status == "COMPLETED"),
+              ok: (.status == "COMPLETED" and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED")),
+              at: (.startedAt | settled_at)
+            }
+            | . + {group: (if .name == "" then ["", $i] else [.name, -1] end)}
+          else
+            {kind: "status_context", name: (.context // ""), ok: (.state == "SUCCESS")}
+          end
+      ]
+    | . as $entries
+    | (
+        ($entries[]
+          | select(.kind == "status_context" and (.ok | not))
+          | .name
+        ),
+        ($entries
+          | [.[] | select(.kind == "check_run")]
+          | group_by(.group)[]
+          | {
+              name: .[0].name,
+              reds: [.[] | select(.ok | not)],
+              newest_green: ([.[] | select(.ok) | .at | select(. != null)] | max)
+            }
+          | select(
+              (.reds | length) > 0
+              and (
+                .newest_green == null
+                or any(.reds[]; (.completed | not) or .at == null)
+                or ([.reds[] | .at] | max) >= .newest_green
+              )
+            )
+          | .name
+        )
+      )
+    | if . == "" then "(unnamed check)" else . end
   ' 2>/dev/null || return 1
 }
 
@@ -765,33 +833,27 @@ require_released_captain_hold() {
 }
 
 FM_PR_MERGE_AUTHORITY=
+# The gate on top of the shared authority read. bin/fm-merge-authority-lib.sh
+# owns what the away-posture record and the task's recorded yolo posture say;
+# this function owns what a merge run may do about it, so the answer the merge
+# poll later tags its ledger row with is the same answer gated here.
 require_away_merge_grant() {
-  local yolo grants grant
   FM_PR_MERGE_AUTHORITY=
-  fm_afk_contract_present "$STATE" || return 0
-  if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-    "$SCRIPT_DIR/fm-afk-contract.sh" validate >/dev/null 2>&1; then
-    echo "error: PR merge refused - the away-posture record could not be read; nothing was merged" >&2
-    return 1
-  fi
-  yolo=$(grep '^yolo=' "$META" | tail -1 | cut -d= -f2- || true)
-  if [ "$yolo" = on ]; then
-    FM_PR_MERGE_AUTHORITY=yolo
+  if fm_merge_authority_resolve "$FM_HOME" "$STATE" "$META" "$ID"; then
+    FM_PR_MERGE_AUTHORITY=$FM_MERGE_AUTHORITY
     return 0
   fi
-  grants=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-    "$SCRIPT_DIR/fm-afk-contract.sh" grants 2>/dev/null) || {
-    echo "error: PR merge refused - the away-posture record's grants could not be read; nothing was merged" >&2
-    return 1
-  }
-  while IFS= read -r grant; do
-    [ "$grant" = "$ID" ] || continue
-    FM_PR_MERGE_AUTHORITY=away-grant
-    return 0
-  done <<EOF
-$grants
-EOF
-  echo "error: task $ID is held for the captain return" >&2
+  case "$FM_MERGE_AUTHORITY_REASON" in
+    record-unreadable)
+      echo "error: PR merge refused - the away-posture record could not be read; nothing was merged" >&2
+      ;;
+    grants-unreadable)
+      echo "error: PR merge refused - the away-posture record's grants could not be read; nothing was merged" >&2
+      ;;
+    *)
+      echo "error: task $ID is held for the captain return" >&2
+      ;;
+  esac
   return 1
 }
 
@@ -801,6 +863,23 @@ require_current_away_authority() {
     echo "error: --allow-red is attended-only; while the away-posture record exists the green check is absolute" >&2
     return 2
   fi
+}
+
+persist_accepted_merge_authority() {
+  local status=0
+  MERGE_META_LOCK=$(fm_meta_lock_path "$META") || return 1
+  fm_lock_acquire_wait "$MERGE_META_LOCK" || return 1
+  fm_merge_authority_persist "$STATE" "$ID" "$META" \
+    "$PROVIDER" "$PR_HOST" "$PR_PATH" "$PR_NUMBER" "$FM_PR_MERGE_AUTHORITY" \
+    || status=1
+  fm_lock_release "$MERGE_META_LOCK" || status=1
+  MERGE_META_LOCK=
+  if [ "$status" -eq 0 ]; then
+    return 0
+  fi
+  printf 'actionable: the forge accepted the merge request for %s but its merge authority could not be persisted; the merge poll remains armed\n' \
+    "$URL" >&2
+  return 1
 }
 
 require_recorded_pr_identity() {
@@ -964,11 +1043,14 @@ case "$PROVIDER" in
     merge_output=$(gh pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" \
       --match-head-commit "$FM_PR_MERGE_HEAD" \
       "${merge_args[@]+"${merge_args[@]}"}" "$@" 2>&1) || merge_status=$?
-    fm_lock_release "$MERGE_CONTROL_LOCK" || true
-    MERGE_CONTROL_LOCK=
     if [ "$merge_status" -eq 0 ]; then
       FM_PR_GITHUB_MERGE_ACCEPTED=true
+      persist_accepted_merge_authority || exit 1
+      fm_lock_release "$MERGE_CONTROL_LOCK" || true
+      MERGE_CONTROL_LOCK=
     else
+      fm_lock_release "$MERGE_CONTROL_LOCK" || true
+      MERGE_CONTROL_LOCK=
       [ -z "$merge_output" ] || printf '%s\n' "$merge_output" >&2
       if github_read_outcome; then
         if [ "$FM_PR_GITHUB_MERGED" != true ] && [ "$FM_PR_GITHUB_QUEUED" != true ]; then
@@ -1011,9 +1093,14 @@ case "$PROVIDER" in
     merge_status=0
     GITLAB_HOST="$FM_PR_HOST" glab mr merge "$PR_NUMBER" -R "$PROJECT_URL" \
       --sha "$FM_PR_MERGE_HEAD" --yes "$@" || merge_status=$?
+    if [ "$merge_status" -ne 0 ]; then
+      fm_lock_release "$MERGE_CONTROL_LOCK" || true
+      MERGE_CONTROL_LOCK=
+      exit "$merge_status"
+    fi
+    persist_accepted_merge_authority || exit 1
     fm_lock_release "$MERGE_CONTROL_LOCK" || true
     MERGE_CONTROL_LOCK=
-    [ "$merge_status" -eq 0 ] || exit "$merge_status"
     gitlab_confirm_rc=0
     gitlab_confirm_merged || gitlab_confirm_rc=$?
     [ "$gitlab_confirm_rc" -eq 0 ] || exit 0
