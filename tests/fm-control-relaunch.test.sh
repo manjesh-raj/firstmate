@@ -29,6 +29,7 @@ set -u
 CONTROL="$ROOT/bin/fm-control.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 PROMOTE="$ROOT/bin/fm-promote.sh"
+BRIEF="$ROOT/bin/fm-brief.sh"
 X_LINK="$ROOT/bin/fm-x-link.sh"
 # fm_test_tmproot's own cleanup trap fires when its command substitution exits,
 # so recreate the root before resolving it and clean it up from this file's trap.
@@ -969,6 +970,71 @@ test_spawn_relaunch_without_a_harness_reuses_the_recorded_one() {
   pass "fm-spawn --relaunch: with no explicit harness it reuses the task's recorded one, never the crew default"
 }
 
+test_promoted_scout_relaunch_receives_the_current_delivery_contract() {
+  local dir home id brief launch out mode rule
+  for mode in no-mistakes direct-PR local-only; do
+    id="rl-promoted-${mode}"
+    dir=$(new_case "promoted-scout-$mode" "$id")
+    home="$dir/home"
+    fm_git_worktree "$dir/proj" "$dir/wt" "task-$id"
+    FM_HOME="$home" "$BRIEF" "$id" firstmate --scout >/dev/null \
+      || fail "$mode: could not scaffold the scout brief"
+    brief="$home/data/$id/brief.md"
+    sed 's/{TASK}/Fix the promotion relaunch contract./; s/{FIRSTMATE_SPEC}/Preserve the current delivery mode./' \
+      "$brief" > "$brief.filled"
+    mv "$brief.filled" "$brief"
+    {
+      echo "window=fmses:fm-$id"
+      echo "endpoint_task_id=$id"
+      echo "worktree=$dir/wt"
+      echo "project=$dir/proj"
+      echo "harness=claude"
+      echo "kind=scout"
+      echo "tasktmp=/tmp/fm-$id"
+      echo "model=default"
+      echo "effort=default"
+    } > "$home/state/$id.meta"
+    printf '%s\n' "fm-$id" > "$dir/fake/windows"
+    printf '%s' "$dir/wt" > "$dir/fake/cwd"
+
+    out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+      "$PROMOTE" "$id" --mode "$mode" --yolo off 2>&1) \
+      || fail "$mode: scout promotion should succeed: $out"
+    assert_grep 'This is a SCOUT task' "$brief" \
+      "$mode: the reproduction fixture lost the original scout delivery text"
+    assert_grep 'Never push to any remote and never open a PR' "$brief" \
+      "$mode: the reproduction fixture lost the stale scout prohibition"
+
+    printf 'zsh' > "$dir/fake/command"
+    out=$(run_spawn "$dir" "$id" --relaunch) \
+      || fail "$mode: promoted scout relaunch should succeed: $out"
+    launch="$home/data/$id/launch-brief.md"
+    assert_grep "This task is now kind=ship with mode=$mode" "$launch" \
+      "$mode: the replacement launch did not receive the promoted task identity"
+    assert_grep 'Any earlier "Never push" or scout-only delivery language in this file is superseded' "$launch" \
+      "$mode: the replacement launch left the stale scout prohibition readable at face value"
+    case "$mode" in
+      direct-PR)
+        rule="1. Never push to the default branch (push only your \`fm/$id\` branch). Never merge a PR." ;;
+      local-only)
+        rule="1. Never push to any remote and never open a PR. Work only on your \`fm/$id\` branch; firstmate handles the merge into local \`main\`." ;;
+      *)
+        rule='1. Never push to the default branch. Never merge a PR.' ;;
+    esac
+    assert_grep "$rule" "$launch" \
+      "$mode: the replacement launch did not receive the current ship push and merge safety rule"
+    assert_grep "git checkout -b fm/$id" "$launch" \
+      "$mode: the replacement launch did not receive its promoted branch name"
+    assert_grep 'Inventory this worktree' "$launch" \
+      "$mode: the replacement launch did not receive the scratch-state inventory step"
+    assert_grep 'Carry over only the intended fix changes' "$launch" \
+      "$mode: the replacement launch did not receive the carry-over boundary"
+    assert_grep "Delivery contract: mode=$mode" "$launch" \
+      "$mode: the replacement launch did not receive the actual ship delivery mode"
+  done
+  pass "fm-promote/fm-spawn --relaunch: the current ship contract supersedes stale scout delivery text"
+}
+
 # fm-spawn arms per-task wiring on harness PREFIXES, because a task launched
 # from a raw command records that command's basename rather than the exact
 # adapter name. Retirement must resolve the same way, or a task recorded as
@@ -1641,6 +1707,7 @@ test_secondmate_relaunch_onto_a_crewmate_only_adapter_refuses_before_stop
 test_explicit_secondmate_harness_ignores_configured_profile_axes
 test_ship_relaunch_ignores_the_crew_harness_config
 test_spawn_relaunch_without_a_harness_reuses_the_recorded_one
+test_promoted_scout_relaunch_receives_the_current_delivery_contract
 test_prefixed_prior_harness_wiring_is_still_retired
 test_muse_session_binding_is_retired_on_a_harness_switch
 test_cursor_session_binding_is_retired_on_a_harness_switch
