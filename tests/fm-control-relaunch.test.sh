@@ -109,7 +109,14 @@ case "${1:-}" in
       esac
     done
     printf 'fakepane\n'; exit 0 ;;
-  capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
+  capture-pane)
+    [ -z "${FM_FAKE_COMPOSER_READ_FAIL:-}" ] || exit 1
+    if [ -s "$D/composer" ]; then
+      printf '╭────╮\n│ %s  │\n╰────╯\n' "$(cat "$D/composer")"
+    else
+      printf '╭────╮\n│    │\n╰────╯\n'
+    fi
+    exit 0 ;;
   list-windows) [ -f "$D/windows" ] && cat "$D/windows"; exit 0 ;;
 esac
 exit 0
@@ -324,6 +331,44 @@ test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint() {
   pass "fm-control relaunch: a same-harness relaunch replaces the agent in the same endpoint and worktree"
 }
 
+test_relaunch_refuses_before_exit_when_the_composer_holds_pending_text() {
+  local dir out rc
+  dir=$(new_case pending-exit rl43)
+  add_ship_task "$dir" rl43 claude
+  printf 'i' > "$dir/fake/composer"
+
+  out=$(run_control "$dir" rl43 relaunch --note "preserve the pending draft"); rc=$?
+
+  expect_code 1 "$rc" "a relaunch must refuse before typing an exit command into pending composer text"
+  assert_contains "$out" "composer visibly holds pending text" \
+    "the refusal should name the pending composer text"
+  [ "$(cat "$dir/fake/command")" = claude ] \
+    || fail "a pending composer refusal must leave the old agent running"
+  assert_no_grep "/exit" "$dir/fake/literal" \
+    "the exit command must not be concatenated onto pending composer text"
+  pass "fm-control relaunch: pending composer text refuses before the exit command is typed"
+}
+
+test_relaunch_refuses_before_exit_when_the_composer_state_is_unproven() {
+  local dir out rc
+  dir=$(new_case unproven-exit rl44)
+  add_ship_task "$dir" rl44 claude
+
+  out=$(FM_FAKE_COMPOSER_READ_FAIL=1 \
+    run_control "$dir" rl44 relaunch --note "preserve on an unreadable composer"); rc=$?
+
+  expect_code 1 "$rc" "a relaunch must refuse before typing an exit command when the composer state cannot be proven empty"
+  assert_contains "$out" "not proven empty" \
+    "the refusal should name the unproven composer state, not claim pending text"
+  assert_not_contains "$out" "visibly holds pending text" \
+    "an unreadable composer is not the same claim as observed pending text"
+  [ "$(cat "$dir/fake/command")" = claude ] \
+    || fail "an unproven composer refusal must leave the old agent running"
+  assert_no_grep "/exit" "$dir/fake/literal" \
+    "the exit command must not be typed when the composer state is not proven empty"
+  pass "fm-control relaunch: an unreadable composer fails safe before the exit command is typed"
+}
+
 test_relaunch_from_linked_home_preserves_recorded_worktree() {
   local dir out rc head fetch_head
   dir=$(new_case linked-home rl42)
@@ -481,9 +526,10 @@ test_disabled_relaunch_clears_prior_trace_context() {
 }
 
 test_relaunch_appends_the_progress_note_to_the_instructions() {
-  local dir out rc brief
+  local dir out rc brief launch_brief first_line role_line task_line
   dir=$(new_case note rl2)
   add_ship_task "$dir" rl2 claude
+  cp "$ROOT/AGENTS.md" "$dir/wt/AGENTS.md"
   out=$(run_control "$dir" rl2 relaunch --note "reproduced the crash in parser.go"); rc=$?
   expect_code 0 "$rc" "relaunch should succeed"$'\n'"$out"
   brief="$dir/home/data/rl2/brief.md"
@@ -492,7 +538,18 @@ test_relaunch_appends_the_progress_note_to_the_instructions() {
   assert_grep "reproduced the crash in parser.go" "$brief" "the note text should reach the replacement"
   assert_grep "reproduced the crash in parser.go" "$dir/home/state/rl2.control-relaunch.note" \
     "the note should also be preserved beside the transaction record"
-  pass "fm-control relaunch: the progress note lands in the instructions the replacement reads"
+  launch_brief="$dir/home/data/rl2/launch-brief.md"
+  first_line=$(sed -n '1p' "$launch_brief")
+  [ "$first_line" = '# Current worker role contract' ] ||
+    fail "a Firstmate-worktree relaunch did not establish the crewmate identity first"
+  role_line=$(grep -n '^# Current worker role contract$' "$launch_brief" | cut -d: -f1)
+  task_line=$(grep -n '^# Task$' "$launch_brief" | head -1 | cut -d: -f1)
+  [ "$role_line" -lt "$task_line" ] || fail "the relaunched worker identity followed its task content"
+  assert_grep "$dir/home/state/rl2.inbox" "$launch_brief" \
+    "the Firstmate-worktree relaunch omitted the worker's exact steering inbox"
+  assert_grep 'do not reject it as another home' "$launch_brief" \
+    "the Firstmate-worktree relaunch did not distinguish its inbox from cross-home state"
+  pass "fm-control relaunch: progress and the Firstmate-worktree worker identity reach the replacement"
 }
 
 test_relaunch_requires_a_note_for_a_ship_task() {
@@ -1559,6 +1616,8 @@ test_relaunch_moves_a_drifted_item_back_in_flight() {
 }
 
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
+test_relaunch_refuses_before_exit_when_the_composer_holds_pending_text
+test_relaunch_refuses_before_exit_when_the_composer_state_is_unproven
 test_relaunch_from_linked_home_preserves_recorded_worktree
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
