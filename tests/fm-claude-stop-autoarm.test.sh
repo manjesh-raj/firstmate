@@ -398,8 +398,14 @@ run_autoarm_against_live_foreign_owner() {  # <dir> <runner>
   printf '%s
 ' "$other" > "$dir/state/.lock"
   INERT_STATUS=0
+  # A leading no-op keeps this a two-statement -c body: bash's tail-call
+  # optimization would otherwise exec the hook directly in place of this
+  # process, erasing the "claude"-named identity the ancestry walk exists to
+  # find - exactly the same collapse the nested-chain test above guards
+  # against, but here it would falsely turn a resolved-ancestry case into an
+  # unresolved one.
   printf '%s
-' '{"session_id":"s"}'     | FM_HOME="$dir" "$runner" -c '"$FM_HOME/bin/fm-claude-stop-autoarm.sh"' >/dev/null 2>&1     || INERT_STATUS=$?
+' '{"session_id":"s"}'     | FM_HOME="$dir" "$runner" -c ': ; "$FM_HOME/bin/fm-claude-stop-autoarm.sh"' >/dev/null 2>&1     || INERT_STATUS=$?
   INERT_OWNER_PID=$other
   kill "$other" 2>/dev/null || true
   wait "$other" 2>/dev/null || true
