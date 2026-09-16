@@ -490,9 +490,13 @@ This is the disconfirming evidence for the leading hypothesis about the 2026-09-
 On 2.1.236 it does not.
 That episode's cause therefore remains open, which is what `state/.claude-autoarm-inert` now exists to settle on the next occurrence.
 
-The end-to-end auto-arm guard `tests/fm-claude-stop-autoarm-live-e2e.test.sh` also passed on 2.1.236 on 2026-09-16, after its prompt was corrected for Claude's run-tier session-open adapter.
-It is intermittent on this version for a reason outside the auto-arm: in headless `-p` mode the session can exit before the hook's exit-2 rewake is delivered, ending the run after one cycle with the ledger still at `arming`.
-A failing run is distinguishable from a real regression by that signature - one arm cycle, one rewake delivery, no model drain, and no `TURN WOULD END BLIND` block.
+The end-to-end auto-arm guard `tests/fm-claude-stop-autoarm-live-e2e.test.sh` is only intermittently green on 2.1.236, and the honest observed rate on 2026-09-16 was 1 pass in 3 runs.
+Do not read it as a passing guard on this version.
+Its prompt was corrected on that date for Claude's run-tier session-open adapter, which the tracked `SessionStart` hook now satisfies itself: a prompt that also asked the model to run session start produced a second digest, and with it a second drain the fixture's budget never accounted for, ending the in-flight need a cycle early.
+Before that correction the guard failed 3 of 3 runs on 2.1.236, including on the unmodified base commit, so the correction is a real recovery and not a masking change.
+The residual failures are outside the auto-arm: in headless `-p` mode the session can exit before the hook's exit-2 rewake is delivered, ending the run after one cycle with the ledger still at `arming`.
+A run that failed that way is distinguishable from a real regression by its signature - one arm cycle, one rewake delivery, no model drain, and no `TURN WOULD END BLIND` block.
+Making this guard deterministic on 2.1.236 is open work; the mechanism evidence above does not depend on it, because the ancestry guard and the deterministic suites cover the behavior this change touches.
 
 Pi same-process session-transition ownership was verified on 2026-09-01 against the tracked extension with provider-free public lifecycle events, retained and fresh extension-module rebinds, and real arm children:
 
