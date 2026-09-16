@@ -15,6 +15,11 @@
 #     the hook delegates guarded recovery to bin/fm-lock.sh and then re-verifies
 #     ownership. A live owner, missing lock, malformed lock, or unresolved
 #     ancestry remains inert, so a competing session never arms or rewakes.
+#     Each such inert firing records WHICH identity gate rejected it, and the
+#     harness ancestry it resolved, in state/.claude-autoarm-inert; the record is
+#     retired once a firing proves it owns the home. It changes no gate - it
+#     exists because these exits are otherwise completely silent, which is what
+#     left the 2026-09-15 frozen-ledger episode undiagnosable.
 #   - AFK: while state/.afk exists the away daemon owns the watcher and triage;
 #     this hook exits 0 and NEVER rewakes the primary (checked again at
 #     translation time so a mid-cycle AFK transition is honored).
@@ -63,6 +68,9 @@
 # state/.claude-autoarm-failure-notified deduplicates the last-resort notice,
 # and state/.claude-autoarm-failure-alarmed bounds the attended fail-open and
 # suppresses any later automatic continuation in that unresolved episode.
+# state/.claude-autoarm-inert is the pre-claim diagnostic above; it is never
+# authority for any decision (fm_autoarm_record_inert in bin/fm-wake-lib.sh owns
+# its format and its confinement to the identity gates).
 #
 # This hook never blocks the Stop decision itself and never prints to stdout:
 # exit 0 is always silent, and exit 2 carries the rewake banner on stderr.
@@ -125,13 +133,23 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 # Defer the mutating claim until after the unchanged AFK and need gates, so an
 # idle or away home remains byte-for-byte inert. Missing or malformed locks are
 # uncertainty rather than stale-owner evidence and remain inert.
+#
+# Every exit below is silent by design, and that silence is what made the
+# 2026-09-15 frozen-ledger episode undiagnosable: the ledger stayed byte-for-byte
+# frozen across many firings with no evidence of which gate was rejecting them,
+# or whether the hook was firing at all. fm_autoarm_record_inert (bin/fm-wake-lib.sh)
+# owns the one-line record that answers exactly that, and changes no gate.
 RECOVER_SESSION_LOCK=0
 if ! fm_session_lock_owned_by_self "$STATE"; then
   LOCK_PID=$(cat "$STATE/.lock" 2>/dev/null || true)
   case "$LOCK_PID" in
-    ''|*[!0-9]*) exit 0 ;;
+    '') fm_autoarm_record_inert "$STATE" identity-no-session-lock; exit 0 ;;
+    *[!0-9]*) fm_autoarm_record_inert "$STATE" identity-malformed-lock; exit 0 ;;
   esac
-  fm_harness_pid_alive "$LOCK_PID" && exit 0
+  if fm_harness_pid_alive "$LOCK_PID"; then
+    fm_autoarm_record_inert "$STATE" identity-live-owner-outside-ancestry "lock_pid=$LOCK_PID"
+    exit 0
+  fi
   RECOVER_SESSION_LOCK=1
 fi
 
@@ -149,9 +167,20 @@ need_supervision || exit 0
 # remain the single acquisition owner, then re-verify current-session identity
 # before touching any auto-arm state.
 if [ "$RECOVER_SESSION_LOCK" -eq 1 ]; then
-  "$SCRIPT_DIR/fm-lock.sh" >/dev/null 2>&1 || exit 0
-  fm_session_lock_owned_by_self "$STATE" || exit 0
+  if ! "$SCRIPT_DIR/fm-lock.sh" >/dev/null 2>&1; then
+    fm_autoarm_record_inert "$STATE" identity-recovery-refused
+    exit 0
+  fi
+  if ! fm_session_lock_owned_by_self "$STATE"; then
+    fm_autoarm_record_inert "$STATE" identity-recovery-unverified \
+      "lock_pid=$(cat "$STATE/.lock" 2>/dev/null || true)"
+    exit 0
+  fi
 fi
+
+# Past every identity gate: this firing proved it belongs to the lock-owning
+# session, so any record of a previous silent identity rejection is history.
+fm_autoarm_clear_inert "$STATE"
 
 # --- single-flight generation claim --------------------------------------------
 # Claude runs one background process per firing with no dedupe. Exactly one
