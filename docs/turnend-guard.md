@@ -120,8 +120,6 @@ In Claude mode, positive watcher recovery clears the block budget, failure notic
 The one loud attended fail-open is available only when the auto-arm has recorded an exhausted failure, its one notice is already consumed, the block budget is exhausted, and a final check finds neither a healthy watcher nor an automatic continuation.
 Each epoch identity is charged at most once per Stop under the budget lock, and a re-block against an epoch the auto-arm did not advance past the previous re-block is charged as well.
 That second rule still bounds an inert auto-arm when a hook never fires or fails before its generation claim and therefore leaves the ledger frozen at its last outcome.
-`state/.claude-autoarm-inert` is what tells those apart after the fact: the auto-arm's identity gates record which one rejected the firing, how many consecutive firings it rejected, and the harness ancestry that firing resolved, so an empty ancestry (a collapsed walk) is distinguishable from a genuinely foreign live owner, and an absent record means no identity gate ran at all.
-It is deliberately confined to those gates - an away or idle home stays byte-for-byte inert - and it is retired as soon as a firing proves it owns the home.
 A verified live foreign session-lock owner takes the earlier diagnostic safe exit instead and never reaches this budget path.
 Charging only epoch changes let the count freeze with that ledger, so the remaining inert-hook cases could re-block without limit and make the attended fail-open unreachable; `budget_account_current_epoch` in `bin/fm-turnend-guard.sh` owns the rule.
 Whenever both coordination locks are needed, positive auto-arm recovery and the terminal check acquire the auto-arm owner lock before the budget lock.

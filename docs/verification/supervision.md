@@ -244,7 +244,7 @@ The blocking and bounded-follow-up mechanisms were validated across seven harnes
 
 | Harness | Version verified | Mechanism | Observed result |
 | --- | --- | --- | --- |
-| Claude | 2.1.236 | Cooperative blocking `Stop` guard plus `asyncRewake` auto-arm | A fresh unsupervised session took the helm through the SessionStart adapter, reclaimed a stale dead-owner lock, completed two tokenless rewake cycles with no model arm command or guard continuation, and left a competing live owner unchanged. The `asyncRewake` hook stayed inside the lock-owning session's harness ancestry throughout (see below). |
+| Claude | 2.1.219 | Cooperative blocking `Stop` guard plus `asyncRewake` auto-arm | A fresh unsupervised session ran session start first, reclaimed a stale dead-owner lock, completed two tokenless rewake cycles with no model arm command or guard continuation, and left a competing live owner unchanged. |
 | Codex | 0.142.1 | Blocking `Stop` hook | Hook process root stayed anchored to the trusted checkout and one continuation ran. |
 | OpenCode | 1.17.6 | Passive `session.idle` callback | Throwing could not block, while `promptAsync` scheduled one TUI follow-up; headless remained fail-open. |
 | Pi | 0.80.5 | Passive `agent_settled` callback | Exactly one guard follow-up ran for an unhealthy cycle, with no recursion across tool turns. |
@@ -493,35 +493,6 @@ grok 0.2.103 (89c3d36fb6f1) [stable]
 | Grok | `FM_GROK_LIVE_E2E=1 tests/fm-grok-continuity-live-e2e.test.sh` | Native task completion surfaced the actionable close and the cycle ledger recorded `reason=actionable-signal`. |
 
 Pi 0.81.1 repeated the continuity and clean-exit lifecycle on 2026-07-23 after the Calm presentation changes.
-
-### Claude `asyncRewake` hook ancestry, 2026-09-16
-
-The auto-arm's identity gate proves a Stop hook belongs to the session holding `state/.lock` by walking that hook's own process ancestry (`fm_session_lock_owned_by_self`, `bin/fm-session-lock-lib.sh`).
-That is only sound while Claude Code keeps an `asyncRewake` hook inside the session's own contiguous harness process tree, which is vendor behavior no stub can confirm.
-`tests/fm-claude-asyncrewake-ancestry-live-e2e.test.sh` is the guard that refreshes this record.
-
-| Question | Method | Result on Claude Code 2.1.236, macOS 26.5.2 arm64 |
-| --- | --- | --- |
-| Does an `asyncRewake` Stop hook keep a harness ancestry? | real hook registered exactly like the tracked one, in an isolated project and home | Yes. The hook is a direct child of the session process; `fm_harness_ancestry_pids` resolves that single pid. |
-| Does it resolve the pid holding the session lock? | `fm_session_lock_owned_by_self` against the lock the SessionStart hook wrote | Yes, headless `-p` and interactive under tmux alike. |
-| Does detachment break the chain over time? | the same hook re-checked at 0s, 45s, and 120s with a background shell running in the session | No. The parent stayed the live session process at every check. |
-
-```text
-FM_CLAUDE_LIVE_E2E=1 tests/fm-claude-asyncrewake-ancestry-live-e2e.test.sh
-ok - Claude 2.1.236 (Claude Code) keeps an asyncRewake Stop hook inside the lock-owning session ancestry (lock=79838 ancestry=79838 parent=claude)
-```
-
-This is the disconfirming evidence for the leading hypothesis about the 2026-09-15 frozen-ledger episode, which proposed that `asyncRewake` detachment had broken this chain and was silently failing the identity gate.
-On 2.1.236 it does not.
-That episode's cause therefore remains open, which is what `state/.claude-autoarm-inert` now exists to settle on the next occurrence.
-
-The end-to-end auto-arm guard `tests/fm-claude-stop-autoarm-live-e2e.test.sh` is only intermittently green on 2.1.236, and the honest observed rate on 2026-09-16 was 1 pass in 3 runs.
-Do not read it as a passing guard on this version.
-Its prompt was corrected on that date for Claude's run-tier session-open adapter, which the tracked `SessionStart` hook now satisfies itself: a prompt that also asked the model to run session start produced a second digest, and with it a second drain the fixture's budget never accounted for, ending the in-flight need a cycle early.
-Before that correction the guard failed 3 of 3 runs on 2.1.236, including on the unmodified base commit, so the correction is a real recovery and not a masking change.
-The residual failures are outside the auto-arm: in headless `-p` mode the session can exit before the hook's exit-2 rewake is delivered, ending the run after one cycle with the ledger still at `arming`.
-A run that failed that way is distinguishable from a real regression by its signature - one arm cycle, one rewake delivery, no model drain, and no `TURN WOULD END BLIND` block.
-Making this guard deterministic on 2.1.236 is open work; the mechanism evidence above does not depend on it, because the ancestry guard and the deterministic suites cover the behavior this change touches.
 
 Pi same-process session-transition ownership was verified on 2026-09-01 against the tracked extension with provider-free public lifecycle events, retained and fresh extension-module rebinds, and real arm children:
 
