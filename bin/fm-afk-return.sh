@@ -553,7 +553,7 @@ return_reconcile() {
       remove_evidence lifecycle "away-posture record unreadable: $retained_live; catch-up stays gated" "$evidence" || lifecycle_ok=0
       append_evidence lifecycle "away-posture record missing: $retained_live; catch-up stays gated" "$evidence"
       lifecycle_ok=0
-    elif ! fm_afk_contract_validate "$retained_live" 1; then
+    elif ! fm_afk_contract_validate "$retained_live"; then
       remove_evidence lifecycle "away-posture record missing: $retained_live; catch-up stays gated" "$evidence" || lifecycle_ok=0
       append_evidence lifecycle "away-posture record unreadable: $retained_live; catch-up stays gated" "$evidence"
       lifecycle_ok=0
@@ -599,7 +599,7 @@ EOF
   append_evidence wake "$drained" "$evidence"
 
   if fm_afk_contract_present "$STATE"; then
-    if ! fm_afk_contract_validate "$(fm_afk_contract_path "$STATE")" 1; then
+    if ! fm_afk_contract_validate "$(fm_afk_contract_path "$STATE")"; then
       append_evidence lifecycle "away-posture record unreadable: $(fm_afk_contract_path "$STATE"); catch-up stays gated" "$evidence"
       lifecycle_ok=0
     else
@@ -610,7 +610,7 @@ EOF
     if [ -z "$archived_contract" ]; then
       append_evidence lifecycle "archived away-posture record missing for entered_epoch $contract_since; catch-up stays gated" "$evidence"
       lifecycle_ok=0
-    elif ! fm_afk_contract_validate "$archived_contract" 1; then
+    elif ! fm_afk_contract_validate "$archived_contract"; then
       append_evidence lifecycle "archived away-posture record unreadable for entered_epoch $contract_since; catch-up stays gated" "$evidence"
       lifecycle_ok=0
     else
@@ -625,7 +625,7 @@ EOF
         remove_evidence lifecycle "superseded away-posture record unreadable: $retained_record; catch-up stays gated" "$evidence" || lifecycle_ok=0
         append_evidence lifecycle "superseded away-posture record missing: $retained_record; catch-up stays gated" "$evidence"
         lifecycle_ok=0
-      elif ! fm_afk_contract_validate "$retained_record" 1; then
+      elif ! fm_afk_contract_validate "$retained_record"; then
         remove_evidence lifecycle "superseded away-posture record missing: $retained_record; catch-up stays gated" "$evidence" || lifecycle_ok=0
         append_evidence lifecycle "superseded away-posture record unreadable: $retained_record; catch-up stays gated" "$evidence"
         lifecycle_ok=0
@@ -640,7 +640,7 @@ EOF
 
     for superseded_record in "$(fm_afk_contract_archive_dir "$STATE")/$contract_since-superseded-"*.afk-contract; do
       [ -f "$superseded_record" ] || continue
-      if ! fm_afk_contract_validate "$superseded_record" 1; then
+      if ! fm_afk_contract_validate "$superseded_record"; then
         append_superseded_record "$superseded_record" "$evidence"
         append_evidence lifecycle "superseded away-posture record unreadable: $superseded_record; catch-up stays gated" "$evidence"
         lifecycle_ok=0

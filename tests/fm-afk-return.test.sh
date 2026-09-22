@@ -377,9 +377,7 @@ test_return_brief_composes_from_record_store_and_held_set() {
   (cd "$dir/home" && tasks-axi add fix-windows 'Fix the windows lane' --file data/backlog.md >/dev/null \
     && tasks-axi hold fix-windows --reason 'awaiting the captain on the merge' --kind captain --file data/backlog.md >/dev/null) \
     || fail "could not seed the held backlog"
-  contract_in "$dir" propose --words $'merge the windows fix when green, then cut a prerelease\nif the install deadlocks abort the competing run' >/dev/null 2>&1 \
-    || fail "could not propose the away-posture record"
-  contract_in "$dir" confirm >/dev/null 2>&1 || fail "could not confirm the away-posture record"
+  contract_in "$dir" enter --words $'merge the windows fix when green, then cut a prerelease\nif the install deadlocks abort the competing run' >/dev/null 2>&1 || fail "could not confirm the away-posture record"
   # Two live blockers, one on a task with a captain-verdict outcome and one on a
   # task with a routine outcome. A third task failed outright.
   printf 'window=synthetic:fm-fix-windows\nbackend=tmux\nkind=ship\n' > "$dir/home/state/fix-windows.meta"
@@ -469,14 +467,12 @@ test_return_brief_keeps_refresh_history() {
   local dir out first_epoch
   dir="$TMP_ROOT/brief-refresh"
   install_runner "$dir"
-  contract_in "$dir" propose --words 'first mandate: merge task first PR when green' >/dev/null 2>&1 || fail "could not propose the first mandate"
-  contract_in "$dir" confirm >/dev/null 2>&1 || fail "could not confirm the first mandate"
+  contract_in "$dir" enter --words 'first mandate: merge task first PR when green' >/dev/null 2>&1 || fail "could not confirm the first mandate"
   first_epoch=$(contract_in "$dir" field entered_epoch)
   outcome_in "$dir" append --task first --verdict routine \
     --summary 'completed before the mandate refresh' --wake 'signal: first.status' >/dev/null \
     || fail "could not seed the pre-refresh outcome"
-  contract_in "$dir" propose --words $'replacement mandate\n\n' >/dev/null 2>&1 || fail "could not propose the replacement mandate"
-  contract_in "$dir" confirm >/dev/null 2>&1 || fail "could not confirm the replacement mandate"
+  contract_in "$dir" enter --words $'replacement mandate\n\n' >/dev/null 2>&1 || fail "could not confirm the replacement mandate"
   [ "$(contract_in "$dir" field entered_epoch)" = "$first_epoch" ] || fail "refresh changed the away-window boundary"
   touch "$dir/home/state/.last-watcher-beat"
   : > "$dir/home/state/.fake-drain"
@@ -520,8 +516,7 @@ test_missing_epoch_record_stays_required_after_disappearing() {
   gate="$dir/home/state/.afk-return-catchup"
   record="$dir/home/state/.afk-contract"
   backup="$dir/valid-record.backup"
-  contract_in "$dir" propose --words 'captain words survive' >/dev/null || fail "could not propose the posture record"
-  contract_in "$dir" confirm >/dev/null || fail "could not confirm the posture record"
+  contract_in "$dir" enter --words 'captain words survive' >/dev/null 2>&1 || fail "could not confirm the posture record"
   epoch=$(contract_in "$dir" field entered_epoch)
   entered=$(contract_in "$dir" field entered)
   cp "$record" "$backup"
@@ -701,8 +696,7 @@ test_return_guard_refuses_while_the_record_exists() {
   local dir out rc
   dir="$TMP_ROOT/guard-record"
   install_runner "$dir"
-  contract_in "$dir" propose >/dev/null 2>&1 || fail "could not propose the away-posture record"
-  contract_in "$dir" confirm >/dev/null 2>&1 || fail "could not write the away-posture record"
+  contract_in "$dir" enter >/dev/null 2>&1 || fail "could not write the away-posture record"
   set +e
   out=$(FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" "$dir/bin/fm-afk-return.sh" guard 2>&1)
   rc=$?
@@ -717,8 +711,7 @@ test_return_brief_health_leads_with_a_gap() {
   local dir out gap_line clean_line
   dir="$TMP_ROOT/brief-gap"
   install_runner "$dir"
-  contract_in "$dir" propose >/dev/null 2>&1 || fail "could not propose the away-posture record"
-  contract_in "$dir" confirm >/dev/null 2>&1 || fail "could not write the away-posture record"
+  contract_in "$dir" enter >/dev/null 2>&1 || fail "could not write the away-posture record"
   : > "$dir/home/state/.watcher-down"
   # A beacon older than the grace, on either date flavor.
   touch "$dir/home/state/.last-watcher-beat"
@@ -739,8 +732,7 @@ test_return_brief_does_not_report_an_acked_watcher_down_marker_as_a_gap() {
   local dir out
   dir="$TMP_ROOT/brief-acked-marker"
   install_runner "$dir"
-  contract_in "$dir" propose >/dev/null 2>&1 || fail "could not propose the away-posture record"
-  contract_in "$dir" confirm >/dev/null 2>&1 || fail "could not write the away-posture record"
+  contract_in "$dir" enter >/dev/null 2>&1 || fail "could not write the away-posture record"
   # An episode that was detected and fully handled during the away window
   # leaves the marker behind in an acked state (fm-wake-lib.sh
   # _fm_recovery_marker_ack); that is not an open gap.
@@ -772,11 +764,9 @@ test_unreadable_superseded_archive_keeps_return_gated() {
   local dir out rc epoch archive backup
   dir="$TMP_ROOT/superseded-unreadable"
   install_runner "$dir"
-  contract_in "$dir" propose --words 'first mandate' >/dev/null 2>&1 || fail "could not propose the first mandate"
-  contract_in "$dir" confirm >/dev/null 2>&1 || fail "could not confirm the first mandate"
+  contract_in "$dir" enter --words 'first mandate' >/dev/null 2>&1 || fail "could not confirm the first mandate"
   epoch=$(contract_in "$dir" field entered_epoch)
-  contract_in "$dir" propose --words 'replacement mandate' >/dev/null 2>&1 || fail "could not propose the replacement mandate"
-  contract_in "$dir" confirm >/dev/null 2>&1 || fail "could not confirm the replacement mandate"
+  contract_in "$dir" enter --words 'replacement mandate' >/dev/null 2>&1 || fail "could not confirm the replacement mandate"
   archive=""
   for archive in "$dir/home/state/afk-contracts/$epoch-superseded-"*.afk-contract; do break; done
   [ -f "$archive" ] || fail "no superseded archive was written"
@@ -809,8 +799,7 @@ test_missing_final_archive_keeps_retained_contract_gated() {
   local dir out rc epoch archive backup
   dir="$TMP_ROOT/final-archive-missing"
   install_runner "$dir"
-  contract_in "$dir" propose --words 'durable mandate' >/dev/null 2>&1 || fail "could not propose the mandate"
-  contract_in "$dir" confirm >/dev/null 2>&1 || fail "could not confirm the mandate"
+  contract_in "$dir" enter --words 'durable mandate' >/dev/null 2>&1 || fail "could not confirm the mandate"
   epoch=$(contract_in "$dir" field entered_epoch)
   seed_live_blocker "$dir" tmux repair-final
   touch "$dir/home/state/.last-watcher-beat"

@@ -96,7 +96,7 @@ The Postures section below is the one, bounded exception to the first three limi
 
 # Postures
 
-You run in one of two postures, and the posture is a file: the away-posture record `state/.afk-contract`, written only by `bin/fm-afk-contract.sh` after the captain confirmed its read-back and archived by the return path on the captain's first ordinary message.
+You run in one of two postures, and the posture is a file: the away-posture record `state/.afk-contract`, written only by `bin/fm-afk-contract.sh` in the same turn as the captain's `/afk` and archived by the return path on the captain's first ordinary message.
 Attended (no record): the role limits above apply exactly as written, main-owned rows never reach you, and MAIN processes every captain outcome you report.
 Away (the record exists): the wake message ends with a `POSTURE: AWAY` tail carrying the record's read-back verbatim; MAIN is parked, you take every row including check rows, decision rows, and heartbeat rows, and captain outcomes remain unprocessed for the return brief even though their visible transcript entries persist.
 The record is the captain's away words, recorded verbatim: the explicit instruction the captain gave before leaving, and the whole mandate.
