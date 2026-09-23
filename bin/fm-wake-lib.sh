@@ -1995,6 +1995,34 @@ fm_wake_restore_queue() {
   fi
 }
 
+# fm_wake_queue_prune_task <state> <task-id> [target]
+# Prune pending durable wakes for <task-id> and its recorded <target> from
+# the wake queue. Removes stale wakes for <target>, signal wakes for the task's
+# status or turn-ended files, and task-specific check wakes.
+fm_wake_queue_prune_task() {  # <state> <task-id> [target]
+  local state=$1 task=$2 target=${3:-}
+  local queue="$state/.wake-queue" lock="$state/.wake-queue.lock" tmp
+  [ -f "$queue" ] || return 0
+  [ -s "$queue" ] || return 0
+  fm_lock_acquire_wait "$lock" || return 1
+  tmp=$(mktemp "$state/.wake-queue.prune.XXXXXX") || { fm_lock_release "$lock"; return 1; }
+  chmod 0600 "$tmp" 2>/dev/null || true
+  awk -F '\t' -v task="$task" -v target="$target" -v state="$state" '
+    NF >= 5 {
+      if ($3 == "stale" && target != "" && $4 == target) next
+      if ($3 == "signal" && ($4 == task || $4 == task ".status" || $4 == task ".turn-ended" || $4 == state "/" task ".status" || $4 == state "/" task ".turn-ended")) next
+      if ($3 == "check" && $4 == state "/" task ".check.sh") next
+    }
+    { print }
+  ' "$queue" > "$tmp" || { rm -f "$tmp"; fm_lock_release "$lock"; return 1; }
+  if ! _fm_atomic_replace "$tmp" "$queue"; then
+    rm -f "$tmp"
+    fm_lock_release "$lock"
+    return 1
+  fi
+  fm_lock_release "$lock"
+}
+
 fm_wake_print_deduped() {
   local file=$1
   awk -F '\t' '
@@ -2493,76 +2521,5 @@ EOF
 $manifest
 EOF
 
-  return 0
-}
-
-# fm_autoarm_record_inert <state-dir> <gate> [detail]
-# Record WHY a Claude Stop auto-arm firing went inert before it ever reached the
-# generation claim, so a repeat of the 2026-09-15 frozen-ledger episode is
-# diagnosable from durable state instead of needing a fresh investigation.
-#
-# That episode produced a byte-for-byte frozen state/.claude-autoarm-epoch across
-# many consecutive Stop events with no marker of any kind, because every pre-claim
-# gate in bin/fm-claude-stop-autoarm.sh exits 0 in complete silence. Nothing on
-# disk could then distinguish "an identity gate rejected this firing" from "the
-# hook never fired at all" - the two candidates docs/turnend-guard.md names.
-#
-# This record answers exactly that question and nothing else. It is deliberately
-# NOT wired to the AFK or supervision-need gates: an away or idle home staying
-# byte-for-byte inert is a documented property of the hook, and the identity
-# class is the one the episode implicated.
-#
-# The file is a single overwritten line, so it is bounded no matter how often the
-# hook fires. <detail> carries the gate's own evidence; the harness ancestry this
-# firing resolved is recorded alongside it, because an EMPTY ancestry is what
-# separates a collapsed ancestry walk (the hypothesized mechanism) from a
-# genuinely different live session correctly holding the lock. `count` is how
-# many consecutive firings reported the identical gate and detail, which is the
-# signal a repeating silent episode otherwise never leaves.
-#
-# Best effort and never fatal: this is an observation of a decision already made,
-# so it must never change whether the caller goes inert. Always returns 0.
-fm_autoarm_record_inert() {  # <state-dir> <gate> [detail]
-  local state=$1 gate=$2 detail=${3:-} file line now ancestry prev_gate prev_detail count first tmp
-  file="$state/.claude-autoarm-inert"
-  [ -d "$state" ] || return 0
-  now=$(date +%s 2>/dev/null) || return 0
-  # fm_harness_ancestry_pids lives in bin/fm-session-lock-lib.sh, which every
-  # caller of this record already sources. A caller that does not gets the
-  # honest "none", which is also what a genuinely collapsed walk reports.
-  ancestry=
-  if declare -F fm_harness_ancestry_pids >/dev/null 2>&1; then
-    ancestry=$(fm_harness_ancestry_pids 2>/dev/null | tr '\n' ',' | sed 's/,$//')
-  fi
-  [ -n "$ancestry" ] || ancestry=none
-  count=1
-  first=$now
-  if [ -r "$file" ]; then
-    line=$(sed -n '1p' "$file" 2>/dev/null || true)
-    prev_gate=${line#*gate=}; prev_gate=${prev_gate%% *}
-    prev_detail=${line#*detail=}
-    case "$line" in *detail=*) : ;; *) prev_detail= ;; esac
-    if [ "$prev_gate" = "$gate" ] && [ "$prev_detail" = "$detail" ]; then
-      count=${line#*count=}; count=${count%% *}
-      case "$count" in ''|*[!0-9]*) count=1 ;; *) count=$((count + 1)) ;; esac
-      first=${line#*first_at=}; first=${first%% *}
-      case "$first" in ''|*[!0-9]*) first=$now ;; esac
-    fi
-  fi
-  tmp="$file.tmp.${BASHPID:-$$}"
-  if printf 'gate=%s count=%s first_at=%s last_at=%s hook_pid=%s ancestry=%s detail=%s\n' \
-      "$gate" "$count" "$first" "$now" "${BASHPID:-$$}" "$ancestry" "$detail" > "$tmp" 2>/dev/null; then
-    mv -f "$tmp" "$file" 2>/dev/null || true
-  fi
-  rm -f "$tmp" 2>/dev/null || true
-  return 0
-}
-
-# fm_autoarm_clear_inert <state-dir>
-# Retire the inert record once a firing gets past the identity gates: the record
-# describes a CURRENT silent condition, and a stale one left behind after the
-# hook recovered would misdirect the next investigation. Best effort, always 0.
-fm_autoarm_clear_inert() {  # <state-dir>
-  rm -f "$1/.claude-autoarm-inert" 2>/dev/null || true
   return 0
 }
