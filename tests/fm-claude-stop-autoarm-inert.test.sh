@@ -194,13 +194,13 @@ test_repeated_identical_inert_firings_accumulate_a_bounded_count() {
 }
 
 test_inert_record_is_retired_once_identity_is_proven() {
-  local dir out status
+  local dir status
   dir=$(make_primary_dir "$TMP_ROOT/inert-cleared")
   : > "$dir/state/task.meta"
   write_arm_fixture "$dir"
   printf 'gate=identity-no-session-lock count=9 first_at=1 last_at=1 hook_pid=1 ancestry=none detail=\n' \
     > "$dir/state/.claude-autoarm-inert"
-  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  run_autoarm "$dir" >/dev/null 2>&1; status=$?
   expect_code 2 "$status" "an owned firing must still arm and rewake"
   assert_absent "$dir/state/.claude-autoarm-inert" "a firing that proved its identity left the stale silent-condition record behind"
   pass "auto-arm: the silent-condition record is retired once a firing proves it owns the home"
