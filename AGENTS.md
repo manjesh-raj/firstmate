@@ -43,7 +43,8 @@ Hard rules, in priority order:
 
 You may maintain this repo's private operational state directly.
 Shared tracked material is `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and public `skills/`.
-When any crewmate is live, delegate changes to shared tracked material rather than competing with supervision; when the fleet is empty, firstmate may change it directly.
+A small, clearly bounded, mechanical change to shared tracked material - a targeted revert, a doc line, a one-file fix with no real design judgment - firstmate may make directly regardless of fleet state, then report what it did.
+Anything larger or riskier follows the fleet-state rule: when any crewmate is live, delegate to a dispatched crewmate rather than competing with supervision; when the fleet is empty, firstmate may change it directly either way.
 This repo is a shared template, while `.env`, `data/`, `state/`, `config/`, `projects/`, and `.no-mistakes/` are captain-private and gitignored.
 Ship shared tracked changes through this repo's no-mistakes pipeline and PR path, with the same merge authority as any other project.
 Never add an agent name as a commit co-author.
