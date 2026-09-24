@@ -46,7 +46,7 @@ A genuinely no-op heartbeat is absorbed in bash and never reaches Pi, and every 
 A broken branch still falls back to today's wake-to-main path in both postures, and the legacy `state/.afk` daemon flag means nothing on Pi.
 While the away-posture record `state/.afk-contract` exists the branch takes every actionable row, no processing turn opens on the parked main, and main's standing authority relocates to the branch through the guarded scripts, each keeping its own gate; [docs/pi-supervision-branch.md](pi-supervision-branch.md#postures) owns that posture.
 While attended the branch's role stays bounded exactly as the captain-approved architecture set it: it cannot merge a PR, land local work, freshly spawn, or answer a decision, and every existing captain gate remains unchanged in either posture.
-Homes on any other primary harness never load this feature and are entirely unaffected.
+Homes on other primary harnesses do not load the Pi branch extension; shared per-task lease behavior is owned by `bin/fm-lease-lib.sh`.
 `AGENTS.md`'s `state/` inventory routes the branch's runtime files to their format and lifecycle owners.
 While attended, a captain-facing (verdict `captain`) branch outcome persists as one exact, sequence-keyed visible transcript entry and then opens one sequence-keyed processing turn on main, which stays open until main acknowledges that sequence through its `fm_branch_processed` tool; while away, the entry persists but processing waits until the record is archived.
 The branch prompt's "Verdict: routine or captain" section owns the distinction between captain-facing, unsolicited routine, and unchanged-review outcomes.
@@ -95,6 +95,21 @@ An effort token Pi would not recognize at all is treated as no pin rather than p
 Cancelling the model picker cancels the whole command and changes neither choice.
 Cancelling only the effort picker keeps the standing effort choice and still applies the model pick made in the same run, and the command's one closing message reports both choices as they will actually take effect.
 Both choices are local to each Firstmate home and are not part of secondmate inherited configuration, the same as the Calm preference; a secondmate home pins its own supervision model and effort with its own `/supervision-model`.
+
+## Supervision host (config/supervision-host)
+
+The optional local, gitignored `config/supervision-host` opts this home into the supervision host, which runs the supervision branch's contract on a headless engine session beside a non-Pi primary; [docs/supervision-host.md](supervision-host.md) owns the design, its current scope, and the verified engines.
+Today only a Claude primary runs it, and only for the away posture: with the file present, the Claude Stop hook runs the host in the watcher arm's place, the host handles wakes on the engine while the away-posture record `state/.afk-contract` exists, and `/afk` launches no away daemon on that home, while `/quiet` still does.
+Absence leaves the home exactly as it is without the host, on every harness; a Pi primary keeps its in-process supervision branch whether or not the file exists.
+The file may be empty, or hold one line `<engine> [<model>]`:
+
+- empty or `default` selects the primary harness's own engine at that engine's default model (`sonnet` for the Claude engine);
+- `<engine> [<model>]` names a verified engine, currently only `claude`, and optionally the engine's own model name or alias; `default <model>` selects the primary harness's engine with that model.
+
+An engine that is not verified, a primary with no verified engine, or a malformed line leaves the host with no engine: it takes no wake, every wake reaches main as it would without the host, and each away-posture wake carries a line naming the problem.
+The file is read at every wake, so a change applies at the next one without a restart.
+It is local to each home and not part of secondmate inherited configuration.
+While the file exists, main's lease-checked commands also take the per-task lease lock, so a claim by the host's engine cannot race a mutation main already started (`bin/fm-lease-lib.sh`).
 
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
@@ -384,6 +399,39 @@ Any other value, or an unreadable file, refuses every spawn from that home, whic
 The file is a captain-wide safety preference, so it is inherited into secondmate homes under the [`secondmate-provisioning`](../.agents/skills/secondmate-provisioning/SKILL.md) inherited-local-material contract; a secondmate's own Claude crewmates then launch on the same posture.
 The [Claude adapter reference](../.agents/skills/harness-adapters/references/harness/claude.md) records the verified shape of both launches and which once-per-machine dialog each one can meet.
 
+## Worker account pin (config/claude-account, config/pi-account)
+
+A home that mixes accounts for one runner, such as a work login and a personal one, can pin the account its own Claude and Pi workers launch on.
+The pin is opt-in: with neither file, every launch is unchanged, and Claude workers keep receiving firstmate's own `CLAUDE_CONFIG_DIR` when it is set.
+Both files are local and gitignored.
+
+| Runner | File | Variable the launch receives | `ordinary` means |
+| --- | --- | --- | --- |
+| `claude` | `config/claude-account` | `CLAUDE_CONFIG_DIR` | the variable unset, so Claude uses its default login |
+| `pi`, `pi-signed` | `config/pi-account` | `PI_CODING_AGENT_DIR` | `~/.pi/agent` |
+
+`config/claude-account` holds one line: `ordinary`, or the absolute path of an existing Claude config directory.
+`config/pi-account` holds that same root on line 1 and, on line 2, the providers this home may spend, separated by spaces, for example `openai-codex anthropic`.
+A final newline is optional; any other line, a relative path, or a control character such as a CR refuses.
+For Claude, `ordinary` unsets `CLAUDE_CONFIG_DIR` rather than pointing it at `~/.claude`, because Claude reads `$CLAUDE_CONFIG_DIR/.claude.json` and keys its macOS Keychain entry to any directory that is set ([authentication, "Credential management"](https://code.claude.com/docs/en/authentication#credential-management)).
+A Pi root can hold several provider logins at once, so the root alone does not say which account a launch spends.
+A pinned Pi launch therefore needs `--model <provider>/<id>` naming a declared provider, and Firstmate also passes `--provider <that provider>` so Pi cannot resolve the model under another signed-in provider.
+An unqualified model, an undeclared provider, or a raw Pi launch command, which cannot receive that flag, refuses; Firstmate never guesses a provider.
+
+When a file is present, every launch of that runner from this home uses it: ships, scouts, local secondmate agents, raw Claude launch commands, and relaunches.
+A raw Claude launch command whose leading assignments set `CLAUDE_CONFIG_DIR` or one of the credentials a pinned launch unsets, such as `ANTHROPIC_API_KEY`, would override the pin, so it refuses and names the variable; remove the assignment from the raw command, or change or remove `config/claude-account`.
+Before any worker endpoint, local copy, or task record exists, and before a relaunch stops the running worker, Firstmate asks the runner itself whether the pinned account is signed in: `claude auth status` for Claude, and `pi auth check --provider <provider> --json --no-refresh` for Pi, falling back to `pi --list-models <provider>` for a provider an extension registers.
+The check runs with only `HOME`, `PATH`, `TMPDIR`, `USER`, `LOGNAME`, and the pinned root in its environment, so a credential variable in firstmate's own environment cannot answer for an empty root.
+A pinned Claude launch also unsets the environment credentials Claude ranks above a stored login, such as `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and the Bedrock and Vertex switches ([authentication precedence](https://code.claude.com/docs/en/authentication#authentication-precedence)).
+Pi ranks a root's stored logins above environment variables, so a pinned Pi launch unsets nothing.
+A home that authenticates Claude through environment credentials on purpose should leave the pin absent.
+
+A malformed file, a root that is not a readable directory, or a signed-out account refuses the launch and names the file to fix; Firstmate never falls back to the ambient account and never changes a global login or copies a credential.
+The spawn prints the pin as `account=` (plus `account_provider=` for Pi) and records the same fields in the task record, so the session-start digest shows which account each worker launched on.
+Pins are not inherited into secondmate homes: a local secondmate agent launches on the launching home's pin, while the secondmate's own workers read the secondmate home's files.
+A remote secondmate is launched on its host from its own home's configuration, so create the file in that remote home.
+[`bin/fm-worker-account-lib.sh`](../bin/fm-worker-account-lib.sh) owns parsing, the sign-in check, and the full list of credentials a Claude launch unsets; [runtime backend verification](verification/runtime-backends.md#worker-account-pin-sign-in-check) records the check against the real runners.
+
 ## Lavish server address (config/lavish-axi-host)
 
 The optional local, gitignored `config/lavish-axi-host` contains one non-empty address without whitespace for the per-machine Lavish server.
@@ -471,6 +519,7 @@ This section is the single owner of the canonical schema and its per-field seman
     {
       "when": "<natural-language condition describing a kind of task>",
       "approval": "captain",
+      "min_confidence": 0.85,
       "floor": { "scope": "<quota-axi scope>", "min_percent": 20, "provider": "<quota-axi provider>" },
       "use": [
         { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max|ultra, optional>", "provider": "<optional quota-axi provider>", "floor": { "scope": "<quota-axi scope>", "min_percent": 50 } }
@@ -488,15 +537,16 @@ Per rule, `when` and `use` are required; the top-level `rules` array itself may 
 Both `use` and the optional top-level `default` accept either one profile object or a non-empty array of profile objects.
 The single-object form stays fully backward-compatible, and every profile needs `harness`.
 Profile `model` and `effort` fields and rule `why` are optional.
-Rule `approval` and `floor`, and profile `provider` and `floor` are optional declarations that only [typed dispatch resolution](#typed-dispatch-resolution-env-typesafe_api_key) applies in code; without that opt-in they are inert, and firstmate's own intake reads them as ordinary hints.
+Rule `approval`, `min_confidence`, and `floor`, and profile `provider` and `floor` are optional declarations that only [typed dispatch resolution](#typed-dispatch-resolution-env-typesafe_api_key) applies in code; without that opt-in they are inert, and firstmate's own intake reads them as ordinary hints.
 The resolver supplies the fixed neutral Choice option `No listed rule applies to this task.` for work that matches no listed rule.
 `approval` accepts only `"captain"` and means a task the rule matches is never dispatched from the tool's answer alone.
+`min_confidence` is a number from 0 through 1 that the rule's own probability in the answer must reach, in place of the resolver's global 0.6 floor on the answer's confidence; set it high on a rule whose wrong pick is costly and low on a rule that is a safe runner-up.
 A rule `floor` names the quota-axi `provider` and `scope` whose `effectivePercentRemaining` must be at least `min_percent` for the rule's profiles to apply.
 A provider-only rule floor on an expanded provider binds to its `default` account row.
 An absent or unknown row or unmeasured provider makes the floor unverifiable and escalates without authorizing default routing.
 A known percentage below the floor makes the tool resolve among `default` profiles instead.
 A profile `provider` optionally names the quota-axi provider family whose rows apply to that profile; when present, profile and rule-floor provider IDs must match the strict whole-string pattern `^[a-z0-9]+(-[a-z0-9]+)*\z`.
-Bootstrap validates resolver-only `approval`, `floor`, and present `provider` values only while typed resolution is active; without the key those inert fields and the pre-existing verified-harness baseline preserve bootstrap behavior.
+Bootstrap validates resolver-only `approval`, `min_confidence`, `floor`, and present `provider` values only while typed resolution is active; without the key those inert fields and the pre-existing verified-harness baseline preserve bootstrap behavior.
 Typed resolution additively recognizes `gemini` because AGENTS.md section 4 verifies it for crewmate and scout dispatch.
 The opted-in resolver has authoritative single-provider mappings for `claude`, `codex`, `grok`, `kimi`, `cursor`, `agy`, and `muse`; every other verified harness must declare `provider` explicitly, including multi-provider `pi`, `pi-signed`, `omp`, and `opencode` and unmapped `gemini`, `rovo`, and `devin`.
 Its single-provider table is separate from the frozen legacy mapping used by `fm-quota-choose.sh`, so additions cannot alter no-key routing.
@@ -514,7 +564,7 @@ See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a star
 When the file exists, bootstrap validates it with `jq`.
 Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstrap emits `BOOTSTRAP_INFO: crew dispatch active config/crew-dispatch.json`, one `BOOTSTRAP_INFO:` fact per rule, and one fact for the optional default profile set.
 Malformed JSON, malformed rules, an empty or malformed profile array, an unverified harness, or an effort value unsupported by that harness is reported as `CREW_DISPATCH: invalid config/crew-dispatch.json - ...`.
-While typed resolution is active, malformed `approval`, `floor`, and present `provider` declarations receive the same diagnostic; without the key those inert declarations preserve the pre-existing bootstrap behavior.
+While typed resolution is active, malformed `approval`, `min_confidence`, `floor`, and present `provider` declarations receive the same diagnostic; without the key those inert declarations preserve the pre-existing bootstrap behavior.
 Missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
 While the file remains present, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration must be reported and corrected rather than selected around.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
@@ -532,16 +582,23 @@ bin/fm-dispatch-resolve.sh data/<id>/brief.md --project <name>        # TOON blo
 ```
 
 Firstmate invokes the resolve path directly after writing the brief, without a preflight; the absent-key off line is handled exactly like every other non-clear outcome.
-When on and at least one rule exists, the tool sends the project name and the whole brief as state and asks one Choice question whose options are every rule's `when` plus the fixed neutral option for no matching rule; the model never sees quota, catalogs, `why`, `use`, or approvals.
+When on and at least one rule exists, the tool sends the project name and the brief's task-specific text as state and asks one Choice question whose options are every rule's `when` plus the fixed neutral option for no matching rule; the model never sees quota, catalogs, `why`, `use`, approvals, or confidence floors.
+The task-specific text is the brief's `## Captain's intent` and `## Firstmate spec` sections under `# Task` that `bin/fm-brief.sh` scaffolds, read by the same parser that feeds `fm-spawn.sh` validation and the no-mistakes `--intent` contract; a brief with neither section is sent whole.
+When the sections are sent from a scout brief, the line `Brief kind: scout (report only)` comes first, taken from the scaffold's scout contract line; ship briefs and briefs sent whole get no kind line.
+A ship brief's delivery mode is deliberately not sent, because in live runs naming it pushed a routine ship brief toward the hardest tier (see [the verification record](verification/dispatch-resolve.md)).
+The scaffold's standard setup, rules, and definition-of-done text is the same in every brief, so leaving it out keeps its safety language from reading as a signal about the task.
 An absent rules file, a default-only file, or `rules: []` returns the non-clear reason `no rules to match` without a model or quota request, leaving firstmate's existing routing in control; an existing but unreadable or malformed rules file, including a broken symlink, remains an actionable exit 2 configuration error.
 Everything after the answer runs in code: the confidence floor, the matched rule's `approval` and `floor`, each candidate's `provider` and `floor`, every applicable account-wide and model/product row from one `quota-axi --json` snapshot, and the numeric `spendPriority` argmax over candidates using each candidate's limiting row.
 The [shared quota library](../bin/fm-quota-axi-lib.sh) accepts schema 5 and schema 6 and implements the [account-matching contract](../.agents/skills/quota-array-dispatch/SKILL.md#1-eligibility).
 An expanded provider with no matching account row leaves the candidate eligible but unranked.
 Known applicable rows from a provider with partial quota semantics remain rankable; rows whose own status is not known remain unrankable.
+A rule that declares `min_confidence` is checked against that rule's own probability, whether it is the picked option or a runner-up, so a runner-up never needs weaker support than it would as the pick.
+A picked rule without `min_confidence`, and the neutral option, keep the global 0.6 floor on the answer's confidence exactly as before, so a file with no declared floors behaves as it did.
+When the picked rule declares its own floor and its probability is below it, the tool takes the most probable other option whose probability clears that option's floor (a rule's `min_confidence`, otherwise 0.6), prints a `fallback:` line naming both floors, and resolves that rule as though it had been picked; no qualifying option, or two equally probable ones, is `ambiguous`.
 Any applicable `exhausted_now` row or known zero bound makes that candidate ineligible, and a known profile-floor shortfall does the same before unrelated quota uncertainty is considered.
 Missing or nonnumeric `spendPriority` evidence is never ranked, and every candidate is printed beside its evidence or the reason it was not rankable, including on ambiguous and approval-gated outcomes that emit no profile.
 On the opted-in path, duplicate concrete profiles with the same harness, model, and effort inside one rule or the default array are configuration errors rather than ties.
-The result is one of `clear` (a `profile:` line ready for `fm-spawn.sh`), `ambiguous` (confidence below the floor), `escalate` (an approval-gated rule, unverifiable rule floor, nothing rankable, or a genuine tie), or `error` (API, network, malformed response metadata, rendering, or quota-axi failure), and every one of them exits 0.
+The result is one of `clear` (a `profile:` line ready for `fm-spawn.sh`), `ambiguous` (confidence below the floor with no runner-up taken), `escalate` (an approval-gated rule, unverifiable rule floor, nothing rankable, or a genuine tie), or `error` (API, network, malformed response metadata, rendering, or quota-axi failure), and every one of them exits 0.
 Response probabilities must contain exactly every offered choice, use numeric values from 0 through 1, and sum to approximately 1 within 0.01.
 Only a usage or configuration error exits 2: an unreadable brief, an existing but unreadable or malformed canonical rules file, or missing `jq`, each reported and never selected around.
 Missing `curl` is a normal structured `error` outcome with exit 0 so firstmate uses today's routing.
@@ -551,7 +608,7 @@ Firstmate passes its profile line unless it states a reason to override, such as
 
 The resolver and bootstrap copy an environment-provided key into a non-exported private variable and unset `TYPESAFE_API_KEY` before launching child processes, so the secret is absent from child environments.
 The resolver sends the key to `curl` only as a header read from a file descriptor, never on argv, and nothing prints, logs, or writes it.
-The resolver fixes the endpoint at `https://api.typesafe.ai`, model at `jev-latest`, confidence floor at 0.6, and request timeout at 5 seconds; `TYPESAFE_API_KEY` is its only resolver-specific environment setting.
+The resolver fixes the endpoint at `https://api.typesafe.ai`, model at `jev-latest`, default confidence floor at 0.6, and request timeout at 5 seconds; `TYPESAFE_API_KEY` is its only resolver-specific environment setting.
 The live rule-match evidence is recorded in [`verification/dispatch-resolve.md`](verification/dispatch-resolve.md).
 
 ## Toolchain
@@ -1250,6 +1307,11 @@ FM_CRASH_BACKOFF=60                # seconds to wait after crossing the crash th
 FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher crash
 FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
 FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
+# supervision host (bin/fm-supervision-host.sh); read only in a home with config/supervision-host
+FM_SUPERVISION_HOST_PARK_SECONDS=27000   # the host ends its park with a cycle-boundary wake after this long, under the Stop hook's 28800 s timeout
+FM_SUPERVISION_HOST_TURN_TIMEOUT=1200    # bound on one engine turn; a turn that hits it hands its wake to main
+FM_SUPERVISION_HOST_ROTATE_TURNS=20      # the engine conversation starts fresh after this many turns (and at every main session start)
+FM_SUPERVISION_ENGINE_GRACE=30           # seconds between TERM and KILL when an engine turn is stopped
 # spoken interface and captain inbox; see "Spoken interface and captain inbox" above
 FM_VOICE_REGION=        # overrides config/voice-region for one relay run
 FM_VOICE_MODEL=         # overrides config/voice-model for one relay run
