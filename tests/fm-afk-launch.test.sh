@@ -25,8 +25,12 @@ START="$ROOT/bin/fm-afk-start.sh"
 CONTRACT="$ROOT/bin/fm-afk-contract.sh"
 # The daemon paths refuse on a Pi primary, so pin a daemon-running harness for
 # every unit below; the Pi refusal has its own units (unit_pi_never_launches_the_daemon).
+# FM_TEST_HARNESS is the launch path's test-only seam (bin/fm-afk-launch.sh
+# fm_afk_launch_primary_harness): the suite calls the entrypoints directly, so a
+# real harness ancestor - a no-mistakes gate agent run under Pi - would outrank
+# the CLAUDECODE=1 marker below and refuse the daemon paths under test.
 unset PI_CODING_AGENT FM_PI_HARNESS CURSOR_AGENT CURSOR_INVOKED_AS GEMINI_CLI ATLASSIAN_AGENT_TYPE ROVODEV_CLI
-export CLAUDECODE=1
+export CLAUDECODE=1 FM_TEST_HARNESS=claude FM_TEST_SEAM=1
 
 FAILED=0
 fail() { printf 'not ok - %s\n' "$1" >&2; FAILED=1; }
@@ -139,6 +143,31 @@ unit_pi_never_launches_the_daemon() {
     fi
     rm -rf "$st"
   done
+}
+
+# A leaked FM_TEST_HARNESS in a real primary's environment must stay inert: the
+# seam fires only alongside the FM_TEST_SEAM marker that test suites set.
+unit_test_harness_seam_requires_the_marker() {
+  local ref stray pinned
+  # shellcheck disable=SC2016 # positional params expand in the child shell.
+  ref=$(env -u FM_TEST_SEAM -u FM_TEST_HARNESS CLAUDECODE=1 \
+    bash -c '. "$1"; fm_afk_launch_primary_harness' _ "$LAUNCH")
+  # shellcheck disable=SC2016 # positional params expand in the child shell.
+  stray=$(env -u FM_TEST_SEAM CLAUDECODE=1 FM_TEST_HARNESS=omp \
+    bash -c '. "$1"; fm_afk_launch_primary_harness' _ "$LAUNCH")
+  [ "$stray" = "$ref" ] \
+    || fail "FM_TEST_HARNESS without FM_TEST_SEAM changed harness detection ($stray != $ref)"
+  # shellcheck disable=SC2016 # positional params expand in the child shell.
+  stray=$(env -u FM_TEST_SEAM CLAUDECODE=1 FM_TEST_HARNESS='1 omp' \
+    bash -c '. "$1"; fm_afk_launch_primary_harness' _ "$LAUNCH")
+  [ "$stray" = "$ref" ] \
+    || fail "a marker-shaped FM_TEST_HARNESS without FM_TEST_SEAM changed harness detection ($stray != $ref)"
+  # shellcheck disable=SC2016 # positional params expand in the child shell.
+  pinned=$(FM_TEST_SEAM=1 CLAUDECODE=1 FM_TEST_HARNESS=omp \
+    bash -c '. "$1"; fm_afk_launch_primary_harness' _ "$LAUNCH")
+  [ "$pinned" = omp ] \
+    || fail "FM_TEST_SEAM-armed FM_TEST_HARNESS did not pin the harness ($pinned)"
+  pass "FM_TEST_HARNESS seam is inert without the test marker"
 }
 
 unit_pi_enter_stop_does_not_claim_a_daemon_terminal() {
@@ -707,6 +736,45 @@ unit_herdr_run_failure_preserves_unconfirmed_record() {
   else
     fail "herdr run failure: unconfirmed exact id was discarded"
   fi
+  rm -rf "$st"
+}
+
+# The daemon terminal is outside the captain's process tree, so it cannot detect
+# the captain's harness itself; each backend's launch must hand it over.
+unit_daemon_terminal_receives_the_primary_harness() {
+  local st entry backend got
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-daemon-harness.XXXXXX")
+  entry="$st/entry"
+  # shellcheck disable=SC2016 # expands in the entry script.
+  printf '#!/usr/bin/env bash\nprintf "%%s" "${FM_DAEMON_PRIMARY_HARNESS-unset}" > "$FM_HOME/daemon-harness"\n' > "$entry"
+  chmod +x "$entry"
+  # shellcheck disable=SC2016 # positional params expand in the child shell.
+  for backend in herdr tmux; do
+    rm -f "$st/daemon-harness"
+    env -u FM_DAEMON_PRIMARY_HARNESS FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_ENTRY="$entry" \
+      FM_TEST_HARNESS=claude bash -c '
+      . "$1"
+      fm_backend_source() { return 0; }
+      fm_backend_herdr_server_ensure() { return 0; }
+      fm_backend_herdr_cli() {
+        if [ "$2 $3" = "workspace create" ]; then
+          printf %s '\''{"result":{"workspace":{"workspace_id":"ws-exact"},"root_pane":{"pane_id":"pane-exact"}}}'\''
+        elif [ "$2 $3" = "pane run" ]; then
+          bash -c "$5"
+        fi
+      }
+      tmux() { [ "$1" = new-session ] && bash -c "$5"; }
+      fm_afk_launch_record_write() { return 0; }
+      fm_afk_launch_commit_terminal() { return 0; }
+      fm_afk_launch_create_"$2" lab:captain "$2"
+    ' _ "$LAUNCH" "$backend" >/dev/null 2>&1
+    got=$(cat "$st/daemon-harness" 2>/dev/null || true)
+    if [ "$got" = claude ]; then
+      pass "$backend daemon terminal: runs with the captain's primary harness"
+    else
+      fail "$backend daemon terminal: primary harness not handed over (got '${got:-nothing}')"
+    fi
+  done
   rm -rf "$st"
 }
 
@@ -1315,6 +1383,7 @@ unit_clear_stale
 unit_enter_records_the_posture_in_one_step_without_a_daemon
 unit_retired_two_step_entry_is_refused
 unit_pi_never_launches_the_daemon
+unit_test_harness_seam_requires_the_marker
 unit_pi_enter_stop_does_not_claim_a_daemon_terminal
 unit_daemon_entry_requires_the_record
 unit_failed_daemon_launch_preserves_the_record
@@ -1334,6 +1403,7 @@ unit_signal_exits_with_lock_cleanup
 unit_herdr_partial_create_recovery
 unit_herdr_error_with_exact_ids_closes_exact
 unit_herdr_run_failure_preserves_unconfirmed_record
+unit_daemon_terminal_receives_the_primary_harness
 unit_record_failure_closes_terminal
 unit_readiness_failure_rolls_back_terminal
 unit_readiness_failure_preserves_unconfirmed_record
