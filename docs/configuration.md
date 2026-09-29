@@ -305,7 +305,7 @@ The host runs the supervision branch's contract on a headless engine session bes
 [docs/supervision-host.md](supervision-host.md) defines its design, current scope, and verified engines.
 A Claude, Cursor, OpenCode, omp, Grok, or Codex primary can run the host.
 With the file present, the primary's arm owner runs the host in place of the watcher arm.
-The host handles wakes on the engine while `state/.afk-contract` exists, and also while attended on a Claude or Cursor primary, whose dialog mirror is verified ([supervision-host.md](supervision-host.md#postures)).
+The host handles wakes on the engine under the [posture rules](supervision-host.md#postures), including an away record and attended operation on a Claude or Cursor primary with a verified dialog mirror.
 On that home, `/afk` launches no away daemon; see [Quiet mode](supervision-host.md#quiet-mode) for `/quiet`'s attended statement and fallback.
 The file also gates the primary's dialog-mirror hooks (`bin/fm-host-mirror.sh`), which record on a Claude or Cursor primary ([supervision-host.md](supervision-host.md#the-dialog-mirror)).
 
@@ -1880,7 +1880,7 @@ Robust reply delivery waits on lavish-axi's exclusive listener.
 **Deliver feedback to the worker**
 
 - The captured result is stored with immutable task-owner routing evidence and delivered directly to that task's steering inbox, without a firstmate `check` wake for the captain's words.
-- Filing that steering note away is not acknowledging the round, so while the round stays open every reconcile puts a live note back in the owner's inbox rather than ringing a filed one.
+- The doorbell rings only when that idempotent write creates a fresh inbox record; filing the note into `handled/` is the worker's own acknowledgement of the delivery, so a later reconcile never moves an already-filed note back into the active inbox or re-rings its owner, and re-delivery of a note still open in the inbox is left to the steering inbox's own re-ring ladder.
 - A task-owned source with an unhandled capture is not relaunched, so delivery failure cannot consume a round and start another poll.
 - That record is the only ownership evidence there is, so while any captured round of it is unacknowledged every retirement path refuses - the runner's own terminal retirement and an explicit `retire` alike - and the refusal names the acknowledgement that releases it.
 
