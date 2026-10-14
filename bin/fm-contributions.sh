@@ -7,18 +7,25 @@
 #   fm-contributions.sh pending
 #   fm-contributions.sh verdict <task> <url> <judged-head> <source-url> <captain|fleet|maintainer|nobody> <summary>
 #   fm-contributions.sh ack <task> <url> <event-token>
+#   fm-contributions.sh retire <task> <url> captain <reason>
 #   fm-contributions.sh arm [--if-owned]
 #
 # snapshot is read-only and never contacts a forge. Its input is the canonical
 # fleet snapshot's backlog/tasks pair; --all adds rows for supervisor inspection.
-# Every URL explicitly linked by a structured backlog row or a task's pr= is
-# owned. Previously observed URLs remain in data/<task>/contributions.json after
+# URLs accepted by canonical_url in fm-contributions.jq and explicitly linked
+# by a structured backlog row or a task's pr= are owned.
+# Previously observed URLs remain in data/<task>/contributions.json after
 # endpoint teardown. Repository-wide PR discovery never establishes ownership.
-# GitHub PRs and issues are supported; other forges remain visibly unmeasured.
+# Only canonical PR and issue URLs on the exact github.com host are supported;
+# other accepted URLs remain visibly unmeasured.
+# poll skips unsupported URLs without forge calls, unavailable output, wakes or
+# new error stamps, and clears their legacy errors without changing observation,
+# timestamps or ownership evidence.
 #
 # This script owns fm-contributions.v1: one atomic file per durable task with
 # task and records[]. Each record contains url, kind, checked_at, error,
-# observation, verdict, seen event tokens, pending events, and notified tokens.
+# observation, verdict, seen event tokens, pending events, notified tokens, and
+# retired provenance once retired.
 # observation is one coherent forge read (a PR head is rechecked after fetching
 # checks/reviews). Checks are normalized by name, id, started_at, status and
 # conclusion; projection picks the newest attempt per distinct name. The last
@@ -30,6 +37,17 @@
 # triage its signal. Formal reviews carry GitHub's own commit_id. Neither kind
 # can grant merge authority. Captain-actor prose requires an existing live hold;
 # an eligible merge remains a captain call, never an automatic forge action.
+#
+# retire ends one task's observation of a contribution whose forge object can
+# never be read again, such as a PR in a deleted repository. It records retired
+# with actor captain, a non-empty reason and the UTC time. It refuses any
+# other actor, a blank reason, and a task/url pair with no saved record or
+# with unacknowledged pending signals. A retired pair leaves known, rotation and coverage even while a
+# backlog link remains. Retiring a retired pair again is a no-op that keeps the
+# first provenance. Nothing un-retires a record, poll never retires one on its
+# own, and a later owner settled from a retired record is not retired. A
+# retirement always records the captain's word: the script cannot verify who
+# runs it, and the authority to retire is the captain's.
 #
 # poll consumes fm-fleet-snapshot.sh --contribution-input, a local-only read,
 # and spends at most FM_CONTRIBUTIONS_BUDGET seconds on forge reads (default 20,
@@ -47,16 +65,16 @@
 # reordering. Terminal URLs settle separately before the forge budget starts
 # and consume no rotation slots.
 # A deliberately smaller configured budget remains bounded and may be
-# unmeasured, rather than being mislabeled unavailable. Each distinct URL is
-# attempted at most once per poll and its observation applied to every owner.
-# A final observation applies
+# unmeasured, rather than being mislabeled unavailable. Each distinct supported
+# URL is attempted at most once per poll and its observation applied to every owner.
+# A supported URL's final observation applies
 # to every owner without another forge read. When the budget refuses a read
 # mid-observation, that URL's records stay untouched and the poll moves to the
 # next URL that still has a full observation reserve; only a genuine forge
 # failure or head change records an error.
 # API failure leaves error evidence; an expired or absent observation is not
 # silence. FM_CONTRIBUTIONS_MAX_AGE (default 900 seconds) bounds freshness.
-# A URL whose last good observation is merged or closed is final: it is
+# A supported URL whose last good observation is merged or closed is final: it is
 # never re-read, stays fresh, and every owner's saved row converges on that
 # observation, with a stale error beside it cleared.
 # A genuine failure prints its unavailable line only when it starts an episode
@@ -331,14 +349,14 @@ settle_final() { # canonical-url task... : copy the URL's final observation to e
   jq -n --slurpfile saved "$TMP/saved.json" --arg url "$url" '
     [$saved[0][] | .records[] | select(.url == $url
       and (.observation.state | IN("merged","closed")))] as $final
-    | ([$final[] | select(.error == null)] | first) // ($final | first)' > "$TMP/final.json"
+    | $final | sort_by([.retired != null, .error != null]) | first' > "$TMP/final.json"
   for task in "$@"; do
     fm_pr_task_id_valid "$task" || { printf 'contributions: invalid durable task id\n'; continue; }
     jq -n --slurpfile saved "$TMP/saved.json" --arg task "$task" --arg url "$url" '
       [$saved[0][] | select(.task == $task) | .records[] | select(.url == $url)] | first' > "$TMP/old.json"
     if jq -e '. == null' "$TMP/old.json" >/dev/null; then
       jq -n --slurpfile final "$TMP/final.json" '
-        $final[0] + {error:null,pending:[],notified:[]}' > "$TMP/row.json"
+        $final[0] + {error:null,pending:[],notified:[]} | del(.retired)' > "$TMP/row.json"
       write_record "$task" "$TMP/row.json"
     elif jq -e '(.observation.state | IN("merged","closed") | not) or .error != null' "$TMP/old.json" >/dev/null; then
       jq -n --slurpfile final "$TMP/final.json" --slurpfile old "$TMP/old.json" '
@@ -348,6 +366,19 @@ settle_final() { # canonical-url task... : copy the URL's final observation to e
   done
 }
 
+clear_unsupported_errors() {
+  local task url
+  while IFS=$'\t' read -r task url; do
+    fm_pr_task_id_valid "$task" || { printf 'contributions: invalid durable task id\n'; continue; }
+    jq -n --slurpfile saved "$TMP/saved.json" --arg task "$task" --arg url "$url" '
+      $saved[0][] | select(.task == $task) | .records[] | select(.url == $url)
+      | .error=null' > "$TMP/row.json"
+    write_record "$task" "$TMP/row.json"
+  done < <(jq_lib -nr --slurpfile saved "$TMP/saved.json" '$saved[0][] | .task as $task | .records[]
+    | select((.url | supported_url | not) and .error != null)
+    | [$task,.url] | @tsv')
+}
+
 poll() {
   local task url old kind error observed
   local -a row
@@ -355,9 +386,11 @@ poll() {
   get_input
   read_saved
   [ "$ERRORS" -eq 0 ] || printf 'contributions: %s unreadable durable record(s)\n' "$ERRORS"
+  clear_unsupported_errors
+  # Only supported URLs enter final settlement and the forge-read rotation.
   # One line per distinct URL: the URL, then every owning task.
   jq_lib -nr --slurpfile input "$TMP/input.json" --slurpfile saved "$TMP/saved.json" '
-    known($input[0];$saved[0])
+    known($input[0];$saved[0]) | map(select(.url | supported_url))
     | group_by(.url) | map({url:.[0].url,tasks:(map(.task) | unique)})
     | .[] | [.url] + .tasks | @tsv' > "$TMP/known.tsv"
   : > "$TMP/live.tsv"
@@ -479,6 +512,25 @@ case "${1:-}" in
       jq --arg head "$1" --arg source "$2" --arg actor "$3" --arg summary "$4" \
         '.verdict={head:$head,source:$source,actor:$actor,summary:$summary}' "$TMP/row.json" > "$TMP/update.json"
     fi
+    write_record "$task" "$TMP/update.json"
+    ;;
+  retire)
+    [ "$#" -eq 5 ] || fail 'retire needs task, URL, actor and reason'
+    task=$2; url=$3
+    fm_pr_task_id_valid "$task" || fail 'invalid contribution task'
+    [ "$4" = captain ] || fail "invalid retire actor '$4'; expected: captain"
+    [ -n "${5//[[:space:]]/}" ] || fail 'retire needs a non-empty reason'
+    acquire; read_saved
+    jq -e --arg task "$task" --arg url "$url" '.[] | select(.task == $task) | .records[] | select(.url == $url)' "$TMP/saved.json" > "$TMP/row.json" \
+      || fail 'contribution is not recorded for this durable task'
+    if jq -e '.retired != null' "$TMP/row.json" >/dev/null; then
+      printf 'contributions: already retired %s for %s\n' "$url" "$task"
+      exit 0
+    fi
+    jq -e '(.pending | length) == 0' "$TMP/row.json" >/dev/null \
+      || fail 'acknowledge pending signals before retiring this contribution'
+    jq --arg actor "$4" --arg reason "$5" --arg at "$NOW" \
+      '.retired={actor:$actor,reason:$reason,at:$at}' "$TMP/row.json" > "$TMP/update.json"
     write_record "$task" "$TMP/update.json"
     ;;
   *) usage >&2; exit 2 ;;
