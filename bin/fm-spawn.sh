@@ -407,17 +407,26 @@
 #   The selector is not inherited into secondmate homes. This is not a
 #   filesystem sandbox; project and harness sandbox
 #   settings still own access to personal credential files.
+# Codex permission mode: docs/configuration.md owns config/codex-permission-mode.
+#
 # Claude permission mode (config/claude-permission-mode):
 #   One token selecting the permission flag every claude launch (ship, scout,
-#   secondmate, and relaunch) carries. Absent or `bypass` keeps today's
-#   `--dangerously-skip-permissions`; `auto` launches with `--permission-mode
-#   auto` instead, Claude Code's classifier-reviewed mode, for a captain who
-#   refuses to run workers in bypass mode. Every other part of the claude launch
+#   secondmate, and relaunch) carries. Absent or `bypass` selects
+#   `--dangerously-skip-permissions`; `auto` selects `--permission-mode auto`,
+#   the model-reviewed remedy for managed machines. Every other part of the claude launch
 #   is unchanged. The token is the file's whitespace-trimmed content; any other
 #   value, or an unreadable file, refuses the spawn before any endpoint,
 #   worktree, or record exists and names the accepted values. The file is read
 #   on every spawn and relaunch, so a change reaches the next launch without a
 #   restart, and it is inherited into secondmate homes (bin/fm-config-inherit-lib.sh).
+# Codex approval mode (config/codex-approval-mode):
+#   One whitespace-trimmed token: absent or `bypass` selects
+#   --dangerously-bypass-approvals-and-sandbox; `approve-for-me` selects
+#   --approve-for-me, with model-reviewed approvals in workspace-write.
+#   Any other value or unreadable file refuses before mutation, like the Claude
+#   file. Both files apply to ships, scouts, secondmates, and relaunches.
+#   bin/fm-approval-failover.sh owns captain-approved durable failover after
+#   firstmate observes a bypass approval prompt or policy refusal; no polling.
 # Worker tool exclusions:
 #   docs/configuration.md "Worker tool exclusions" owns config/crew-exclude-tools
 #   and its operator contract. Resolve it with bin/fm-exclude-tools-lib.sh
@@ -513,13 +522,18 @@
 # guard predates that pointer keeps the ordinary Stop idle hook instead.
 # Kimi uses one surgically installed Firstmate region in $HOME/.kimi-code/config.toml,
 # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
-# Kimi 2.0.0 also gates a fresh worktree on an interactive folder-trust dialog.
+# Kimi also gates a fresh worktree on an interactive folder-trust prompt, whose
+# wordings bin/fm-kimi-trust-lib.sh recognizes (2.0.0 and 2.3.0 recorded).
 # Its launch-readiness loop reads the visible viewport - so the spawn refuses at
 # preflight on a backend with no viewport-bounded capture - recognizes the
 # complete dialog, re-selects the already highlighted affirmative option on
 # every poll the complete dialog is still there, refuses any ready verdict while
 # dialog text is on that pane, and requires two consecutive captures that are
 # each ready and dialog-free before the ordinary readiness gates can pass. A
+# prompt that announces project MCP servers (Kimi 2.3.0 reads a root .mcp.json
+# as well as .kimi-code/mcp.json) or that pages its disclosure receives no key
+# and fails readiness with the reason: answering it starts those servers, and
+# Kimi's per-folder trust is not a consent decision that covers them. A
 # blank viewport read proves nothing either way: it costs the poll and restarts
 # that count. A viewport read that fails outright fails readiness at once.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
@@ -732,6 +746,57 @@ case "$CLAUDE_PERMISSION_MODE" in
 auto) CLAUDE_PERM_FLAG='--permission-mode auto' ;;
 *) CLAUDE_PERM_FLAG='--dangerously-skip-permissions' ;;
 esac
+if ! CODEX_APPROVAL_PRESENT=$(fm_config_source_present "$CONFIG/codex-approval-mode"); then
+  exit 1
+fi
+CODEX_APPROVAL_MODE=bypass
+if [ "$CODEX_APPROVAL_PRESENT" = 1 ]; then
+  if [ ! -f "$CONFIG/codex-approval-mode" ] || [ ! -r "$CONFIG/codex-approval-mode" ]; then
+    echo "error: config/codex-approval-mode must be a readable regular file holding one of: bypass, approve-for-me" >&2
+    exit 1
+  fi
+  if ! CODEX_APPROVAL_MODE=$(perl -0777 -pe 's/\A\s+|\s+\z//g' <"$CONFIG/codex-approval-mode"); then
+    echo 'error: could not read config/codex-approval-mode' >&2
+    exit 1
+  fi
+  case "$CODEX_APPROVAL_MODE" in
+    bypass | approve-for-me) ;;
+    *)
+      echo "error: config/codex-approval-mode holds '$CODEX_APPROVAL_MODE'; accepted values are: bypass (the default), approve-for-me" >&2
+      exit 1
+      ;;
+  esac
+fi
+case "$CODEX_APPROVAL_MODE" in
+  approve-for-me) CODEX_APPROVAL_FLAG='--approve-for-me' ;;
+  *) CODEX_APPROVAL_FLAG='--dangerously-bypass-approvals-and-sandbox' ;;
+esac
+# Resolve the opt-in Codex posture before any spawn or relaunch mutation.
+# docs/configuration.md owns config/codex-permission-mode and its limits.
+CODEX_PERMISSION_MODE=bypass
+if ! CODEX_PERM_PRESENT=$(fm_config_source_present "$CONFIG/codex-permission-mode"); then
+  exit 1
+fi
+if [ "$CODEX_PERM_PRESENT" = 1 ]; then
+  if [ ! -f "$CONFIG/codex-permission-mode" ] || [ ! -r "$CONFIG/codex-permission-mode" ]; then
+    echo "error: config/codex-permission-mode must be a readable regular file holding bypass or restricted" >&2
+    exit 1
+  fi
+  CODEX_PERMISSION_MODE=$(cat "$CONFIG/codex-permission-mode") || exit 1
+  case "$CODEX_PERMISSION_MODE" in
+  bypass | restricted) ;;
+  *)
+    echo "error: config/codex-permission-mode must contain bypass or restricted" >&2
+    exit 1
+    ;;
+  esac
+fi
+# Restricted replaces whichever approval flag was selected above, and the task
+# record reports it so approval failover never treats the launch as bypass.
+if [ "$CODEX_PERMISSION_MODE" = restricted ]; then
+  CODEX_APPROVAL_MODE=restricted
+  CODEX_APPROVAL_FLAG='--sandbox workspace-write --ask-for-approval on-request'
+fi
 # config/lavish-axi-host is the primary-owned per-machine address for the
 # shared Lavish server. Read it once per launch and refuse malformed values so
 # every worker reaches the same server instead of starting a second one.
@@ -779,6 +844,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-secondmate-nudge-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-kimi-trust-lib.sh
+. "$SCRIPT_DIR/fm-kimi-trust-lib.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -2407,7 +2474,7 @@ launch_template() {
   # stay in force.
   # __CLAUDEPERMFLAG__ is the permission flag config/claude-permission-mode
   # selects (header above): --dangerously-skip-permissions by default, or
-  # --permission-mode auto for a captain who refuses bypass mode.
+  # --permission-mode auto when configured.
   # __CLAUDEADDDIRS__ is the task-channel directory grant
   # claude_add_dirs_flag below builds: Claude path-checks Read/Glob/Grep (and
   # an Edit's mandatory prior Read) against cwd plus --add-dir, and since
@@ -2433,8 +2500,8 @@ launch_template() {
     # naming it is passed. A record that cannot be published stops the spawn.
     printf '%s' '__MODELFLAG____EFFORTFLAG____BRIEFDOORBELL__'
     ;;
-  # --disable hooks (equivalent to -c features.hooks=false) turns codex's whole
-  # lifecycle-hook layer off for CREWMATE and SCOUT launches only.
+  # --disable hooks (equivalent to -c features.hooks=false) requests that codex
+  # turn its whole lifecycle-hook layer off for CREWMATE and SCOUT launches only.
   # Without it a crewmate launch parks forever on codex's hook-trust modal
   # ("N hooks are new or changed"), whose selection sits on "Review hooks" -
   # neither trusting nor declining. Firstmate's key plane carries Enter, Escape
@@ -2447,19 +2514,26 @@ launch_template() {
   # disabled, codex-cli 0.151.0), and firstmate's own .codex/hooks.json registers
   # PRIMARY-session infrastructure that already stands down in a child worktree.
   # This is the opposite of --dangerously-bypass-hook-trust, which RUNS untrusted
-  # hooks; disabling the feature runs none of them and leaves the operator's
-  # ~/.codex untouched. An unknown feature name is a hard codex error, so a future
-  # release that drops this flag fails the launch loudly instead of silently
-  # restoring the modal.
+  # hooks; when honored, disabling the feature runs none of them and leaves the
+  # operator's ~/.codex untouched. An unknown feature name is a hard codex error, so a future
+  # release that drops this flag stops the launch rather than silently restoring
+  # the modal. A managed policy can override the requested disablement, so its
+  # effective hook state is not guaranteed.
+  # --approve-for-me uses Codex's automatic approval review with its workspace-write
+  # sandbox. When selected, it replaces complete bypass because managed settings
+  # can override its approval component while accepting the sandbox bypass. The
+  # workspace-write sandbox starts with network access disabled and reviews writes
+  # outside the worktree, so networked operations and external task channels may
+  # need automatic review before they proceed.
   # A secondmate is a firstmate PRIMARY in its own home, and its turn-end guard,
   # session-start digest, and cd/arm seatbelts are exactly those project hooks
   # (docs/turnend-guard.md, docs/sessionstart-nudge.md, docs/cd-guard.md), so the
-  # secondmate launch deliberately keeps hooks on.
+  # secondmate launch deliberately keeps hooks on but shares this approval posture.
   codex)
     if [ "$kind" = secondmate ]; then
-      printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      printf '%s' 'codex __MODELFLAG____EFFORTFLAG____CODEXAPPROVALFLAG__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
     else
-      printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox --disable hooks -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      printf '%s' 'codex __MODELFLAG____EFFORTFLAG____CODEXAPPROVALFLAG__ --disable hooks -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
     fi
     ;;
   opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}__EFFORTFLAG__}'\'' __OPENCODEBIN__ __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
@@ -4740,29 +4814,15 @@ kimi_composer_is_empty() {
   [ "$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null)" = empty ]
 }
 
-# The navigation hint is matched as its two distinctive tokens rather than as
-# one row: a pane narrower than the row wraps it, and a wrapped hint is still
-# the complete dialog waiting for an answer.
-kimi_trust_dialog_is_visible() { # <plain-pane-capture>
-  local pane=$1
-  case "$pane" in *'Trust this folder?'*) ;; *) return 1 ;; esac
-  case "$pane" in *'↑↓ navigate'*) ;; *) return 1 ;; esac
-  case "$pane" in *'Enter select'*) ;; *) return 1 ;; esac
-  case "$pane" in *'❯ Trust this folder'*) ;; *) return 1 ;; esac
-  case "$pane" in *"Don't trust"*) ;; *) return 1 ;; esac
-}
-
-# The complete dialog above decides whether to press Enter. Any single marker
-# of it on the visible pane decides whether that pane is safe to call ready: a
-# capture caught mid-redraw and one that has painted only the dialog's box
-# title both fail the complete-dialog test while the dialog is still up and
-# waiting, with Kimi's startup banner sitting above it in that same capture.
-# Treating such a pane as ready would type the brief pointer into the dialog
-# and lose it.
-kimi_trust_marker_is_present() { # <plain-pane-capture>
-  case "$1" in *'Trust this folder'* | *"Don't trust"*) return 0 ;; esac
-  return 1
-}
+# The folder-prompt predicates (complete dialog, any dialog marker, paged
+# disclosure, project-server announcement) come from bin/fm-kimi-trust-lib.sh,
+# which the live guard shares. The complete dialog decides whether to press
+# Enter. Any single marker of it on the visible pane decides whether that pane
+# is safe to call ready: a capture caught mid-redraw and one that has painted
+# only the dialog's title both fail the complete-dialog test while the dialog
+# is still up and waiting, with Kimi's startup banner sitting above it in that
+# same capture. Treating such a pane as ready would type the brief pointer
+# into the dialog and lose it.
 
 # A successful key send is not evidence that Kimi accepted trust. Only the
 # ordinary readiness signals in a later capture prove advancement.
@@ -4774,7 +4834,7 @@ kimi_ready_signal_is_present() { # <plain-pane-capture>
 kimi_wait_for_ready() {
   local pane capture_rc i=0 max=${FM_KIMI_READY_POLLS:-60} interval=${FM_KIMI_POLL_INTERVAL:-0.5}
   local trust_enters=0 trust_seen=0 trust_still_visible=0 trust_markers_pending=0
-  local ready_captures=0
+  local trust_affirmative='' trust_negative='' ready_captures=0
   KIMI_READY_FAILURE_DETAIL='kimi did not show a verified ready signal before brief delivery'
   while [ "$i" -lt "$max" ]; do
     capture_rc=0
@@ -4789,11 +4849,24 @@ kimi_wait_for_ready() {
       [ "$i" -ge "$max" ] || sleep "$interval"
       continue
     fi
+    # Both refusals come before the complete-dialog test on purpose: the
+    # announcing prompt and the paged prompt are complete dialogs, and the
+    # only thing that keeps Enter off them is deciding here first.
+    if kimi_pane_announces_project_mcp_servers "$pane"; then
+      KIMI_READY_FAILURE_DETAIL="kimi's folder prompt announces project MCP servers, so Firstmate did not answer it and did not send the brief; answering would start those servers without a consent decision that covers them. Remove the project MCP servers this directory declares (the prompt's Config line names the file), or wait for a later consent design."
+      return 1
+    fi
+    if kimi_trust_prompt_is_paged "$pane"; then
+      KIMI_READY_FAILURE_DETAIL="kimi's folder prompt pages what trusting would activate, so Firstmate could not read all of it and did not answer it; give the worker pane more rows and relaunch."
+      return 1
+    fi
     if kimi_trust_dialog_is_visible "$pane"; then
       trust_seen=1
       trust_still_visible=1
       trust_markers_pending=0
       ready_captures=0
+      trust_affirmative=$KIMI_TRUST_AFFIRMATIVE
+      trust_negative=$KIMI_TRUST_NEGATIVE
       # Kimi swallows keypresses during its startup window - the same hazard
       # FM_KIMI_SUBMIT_RETRIES covers for the brief pointer - so the
       # affirmative selection is re-sent on every poll the complete dialog is
@@ -4827,9 +4900,9 @@ kimi_wait_for_ready() {
     [ "$i" -ge "$max" ] || sleep "$interval"
   done
   if [ "$trust_still_visible" -eq 1 ]; then
-    KIMI_READY_FAILURE_DETAIL="kimi trust dialog did not clear after selecting 'Trust this folder' on $trust_enters poll(s); saw 'Trust this folder?', the navigation hint, selected 'Trust this folder', and the negative Don't trust option"
+    KIMI_READY_FAILURE_DETAIL="kimi trust dialog did not clear after selecting '$trust_affirmative' on $trust_enters poll(s); saw 'Trust this folder?', the navigation hint, selected '$trust_affirmative', and the negative $trust_negative option"
   elif [ "$trust_seen" -eq 1 ]; then
-    KIMI_READY_FAILURE_DETAIL="kimi trust dialog was answered but the pane never advanced to a verified ready signal; saw 'Trust this folder?', the navigation hint, selected 'Trust this folder', and the negative Don't trust option"
+    KIMI_READY_FAILURE_DETAIL="kimi trust dialog was answered but the pane never advanced to a verified ready signal; saw 'Trust this folder?', the navigation hint, selected '$trust_affirmative', and the negative $trust_negative option"
   elif [ "$trust_markers_pending" -eq 1 ]; then
     KIMI_READY_FAILURE_DETAIL="kimi did not show a verified ready signal before brief delivery; trust dialog text stayed on screen without the complete dialog, so the pane was never safe to answer or to treat as ready"
   fi
@@ -6145,7 +6218,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -6157,6 +6230,12 @@ preserve_relaunch_meta() {
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
   echo "harness=$HARNESS"
+  if [ "$RAW_LAUNCH" = 0 ]; then
+    case "$HARNESS" in
+      claude) echo "approval_mode=$CLAUDE_PERMISSION_MODE" ;;
+      codex) echo "approval_mode=$CODEX_APPROVAL_MODE" ;;
+    esac
+  fi
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"
@@ -6348,6 +6427,7 @@ case "$LAUNCH" in
   fi
   ;;
 esac
+LAUNCH=${LAUNCH//__CODEXAPPROVALFLAG__/$CODEX_APPROVAL_FLAG}
 if [ "$KEEP_AI_TRAILERS" = 1 ]; then
   LAUNCH=${LAUNCH//__CLAUDEATTRIBUTION__/}
 else
