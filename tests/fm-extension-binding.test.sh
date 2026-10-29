@@ -18,7 +18,7 @@ fi
 
 extension_segment=${FM_EXTENSION_BINDING_SEGMENT:-all}
 case "$extension_segment" in
-  all|coordinator|early-bind|early-validation|early-handshake|early-integrity|matrix|matrix-runtime|lifecycle-flow|lifecycle-order|lifecycle-lock|lifecycle-runner|lifecycle-state|lifecycle-invocation-cleanup|remote-envelope|remote-activation|remote-lifecycle|remote-retirement|example|coordinator-fail|coordinator-wait|coordinator-stubborn|coordinator-pass|coordinator-late-pass|coordinator-scheduler-block|coordinator-scheduler-late) ;;
+  all|coordinator|early-bind|early-validation|early-handshake|early-integrity|matrix|matrix-runtime|lifecycle-flow|lifecycle-host-errors|lifecycle-order|lifecycle-lock|lifecycle-runner|lifecycle-state|lifecycle-invocation-cleanup|remote-envelope|remote-activation|remote-lifecycle|remote-retirement|example|coordinator-fail|coordinator-wait|coordinator-stubborn|coordinator-pass|coordinator-late-pass|coordinator-scheduler-block|coordinator-scheduler-late) ;;
   *) printf 'unknown extension-binding segment: %s\n' "$extension_segment" >&2; exit 64 ;;
 esac
 
@@ -253,6 +253,9 @@ elif mode in ("replay", "replay-no-result"):
         except FileNotFoundError: prior = 0
         open(count_path, "w", encoding="utf-8").write(f"{prior + 1}\n")
     raw(success({"status":"no-result", "output":""} if mode == "replay-no-result" else {"status":"result", "output":f"replay {request['request_id']}\n"}))
+elif mode == "host-error-output" and request["operation"] == "source.poll":
+    evidence = {"schema":"firstmate.process-event-extension-error.v1", "extension_id":manifest["id"], "operation":"source.poll", "code":"package-missing"}
+    raw(success({"status":"result", "output":json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"}))
 elif mode.startswith("active-block|"):
     _, block_marker, block_release = mode.split("|", 2)
     write_exclusive(block_marker, f"{os.getpid()}\n")
@@ -260,7 +263,7 @@ elif mode.startswith("active-block|"):
     raw(success({"status":"result", "output":"active runner completed\n"}))
 elif request["operation"] == "source.poll": raw(success({"status":"no-result" if mode == "no-result" else "result", "output":"" if mode == "no-result" else f"external evidence: {mode}\n"}))
 elif request["operation"] == "result.classify": raw(success({"classification":"external-ready"}))
-elif request["operation"] == "result.terminal": raw(success({"value":True}))
+elif request["operation"] == "result.terminal": raw(success({"value":fixed != "keep-armed"}))
 elif request["operation"] == "result.silent":
     content = request.get("input", {}).get("content", "")
     if content == "external evidence: crash-silent\\n":
@@ -1078,6 +1081,141 @@ resolution_missing=$(FM_HOME="$H_MISSING" "$HOST" inspect org.example.missing 2>
 assert_contains "$resolution_missing" "manifest entrypoint is missing" "missing executable was not diagnosed"
 pass "a missing package executable refuses instead of falling back"
 fi
+fi
+
+# --- repeated host failures remain bounded without blocking recovery --------
+if section_enabled lifecycle-host-errors; then
+host_error_case() {
+  local shape=$1 case_root="$TMP_ROOT/host-error-$1" home package installed binding_file saved_binding
+  local source="host-error-$1" expected_code poll_count result_count command round log runner_pid result
+  local HOME XDG_STATE_HOME FM_PROCEVENT_CLAIM_ROOT PROCEVENT=$PROCEVENT
+  mkdir -p "$case_root/user-home"
+  export HOME="$case_root/user-home" XDG_STATE_HOME="$case_root/xdg"
+  export FM_PROCEVENT_CLAIM_ROOT="$XDG_STATE_HOME/firstmate/procevent-claims"
+  export FM_PROCEVENT_LAUNCH_FLOOR_SECONDS=1 FM_PROCEVENT_LAUNCH_CONFIRM_SECONDS=10
+  home="$case_root/home"; new_home "$home"
+  package="$case_root/package"
+  make_package "$package" "org.example.$shape" ext-host-error
+  bind_package "$home" "$package" ext-host-error >/dev/null || fail "cannot bind $shape fixture"
+  installed=$(binding_value "$home" "org.example.$shape" package_root)
+  binding_file="$home/config/extensions.d/org.example.$shape.json"
+  fm_test_track_procevent_home "$home" "$FM_PROCEVENT_CLAIM_ROOT"
+  FM_HOME="$home" "$PROCEVENT" register-extension ext-host-error "$source" --config-ref replay-no-result >/dev/null \
+    || fail "cannot register $shape fixture"
+  FM_HOME="$home" "$PROCEVENT" start "$source" > "$case_root/healthy.out" \
+    || fail "healthy $shape fixture failed"
+  poll_count="$home/state/extensions/org.example.$shape/request-ids"
+  [ "$(wc -l < "$poll_count" | tr -d ' ')" -eq 1 ] || fail "healthy poll did not reach adapter"
+  case "$shape" in
+    package)
+      mv "$installed" "$installed.saved"
+      expected_code='package-missing'
+      ;;
+    conflict)
+      make_package "$case_root/other-package" org.example.other ext-other
+      node -e 'const fs=require("fs"); const p=process.argv[1]; const m=JSON.parse(fs.readFileSync(p)); m.capabilities[0].adapter_names.push("ext-host-error"); fs.writeFileSync(p,JSON.stringify(m)+"\n");' \
+        "$case_root/other-package/firstmate-extension.json"
+      bind_package "$home" "$case_root/other-package" ext-other >/dev/null
+      cp "$home/config/extensions.d/org.example.other.json" "$case_root/other-binding.saved"
+      node -e 'const fs=require("fs"); const p=process.argv[1]; const b=JSON.parse(fs.readFileSync(p)); b.capabilities[0].adapter_names=["ext-host-error"]; fs.writeFileSync(p,JSON.stringify(b)+"\n");' \
+        "$home/config/extensions.d/org.example.other.json"
+      expected_code='adapter-conflict'
+      ;;
+    barrier)
+      mkdir -p "$case_root/code"
+      cp -R "$ROOT/bin" "$case_root/code/bin"
+      mv "$case_root/code/bin/fm-extension-launch-barrier.mjs" "$case_root/code/bin/fm-extension-launch-barrier.original.mjs"
+      printf '%s\n' 'await new Promise(resolve => setTimeout(resolve, 15000));' \
+        'await import("./fm-extension-launch-barrier.original.mjs");' > "$case_root/code/bin/fm-extension-launch-barrier.mjs"
+      PROCEVENT="$case_root/code/bin/fm-procevent.sh"
+      expected_code=timeout
+      ;;
+  esac
+  for round in 1 2 3 4 5; do
+    command=start
+    [ "$round" -lt 3 ] || command=reconcile
+    log="$case_root/$round.out"
+    if [ "$command" = start ]; then
+      FM_HOME="$home" "$PROCEVENT" start "$source" > "$log" 2>&1 || fail "$shape start failed: $(cat "$log")"
+    else
+      FM_HOME="$home" "$PROCEVENT" reconcile > "$log" 2>&1 || fail "$shape reconcile failed: $(cat "$log")"
+      assert_contains "$(cat "$log")" 'started=1' "$shape reconcile did not launch a recovery poll"
+    fi
+    # Reconcile confirms a launch, not completion. Wait on this private source's
+    # recorded runner and claim, so the next command exercises a settled retry.
+    for _ in $(seq 1 600); do
+      runner_pid=$(sed -n '2p' "$FM_PROCEVENT_CLAIM_ROOT/$source.claim" 2>/dev/null || true)
+      if [ ! -e "$home/state/procevent/$source.runner" ] && [ -z "$runner_pid" ]; then break; fi
+      sleep 0.05
+    done
+    [ -z "$runner_pid" ] || fail "$shape runner did not settle"
+    result_count=0
+    for result in "$home/state/procevent-inbox/$source".*.result; do
+      [ -f "$result" ] || continue
+      result_count=$((result_count + 1))
+      assert_grep "\"code\":\"$expected_code\"" "$result" "$shape captured the wrong failure"
+      assert_absent "${result%.result}.handled" "$shape retry acknowledged its earlier failure"
+    done
+    [ "$result_count" -eq 1 ] || fail "$shape retry $round allocated $result_count distinct errors"
+    [ "$(wc -l < "$poll_count" | tr -d ' ')" -eq 1 ] || fail "$shape failure entered adapter polling"
+  done
+  assert_contains "$(wake_payloads "$home")" "procevent ext-host-error $source 1" "$shape first failure was suppressed"
+  case "$shape" in
+    package) mv "$installed.saved" "$installed" ;;
+    conflict) cp "$case_root/other-binding.saved" "$home/config/extensions.d/org.example.other.json" ;;
+    barrier) mv "$case_root/code/bin/fm-extension-launch-barrier.original.mjs" "$case_root/code/bin/fm-extension-launch-barrier.mjs" ;;
+  esac
+  FM_HOME="$home" "$PROCEVENT" start "$source" > "$case_root/recovery.out" 2>&1 || fail "$shape recovery failed"
+  assert_contains "$(cat "$case_root/recovery.out")" 'no-result:' "$shape recovery did not complete"
+  [ "$(wc -l < "$poll_count" | tr -d ' ')" -eq 2 ] || fail "$shape recovery was blocked by old evidence"
+  assert_absent "$home/state/procevent-inbox/$source.2.result" "$shape recovery allocated another error"
+  assert_absent "$home/state/procevent-inbox/$source.1.handled" "$shape recovery acknowledged old evidence"
+
+  # A changed host failure retains its own durable identity.
+  saved_binding="$case_root/binding.saved"
+  mv "$binding_file" "$saved_binding"
+  FM_HOME="$home" "$PROCEVENT" start "$source" > "$case_root/changed.out" 2>&1 || fail "$shape changed poll failed"
+  assert_present "$home/state/procevent-inbox/$source.2.result" "$shape changed host failure was suppressed"
+  cmp -s "$home/state/procevent-inbox/$source.1.result" "$home/state/procevent-inbox/$source.2.result" \
+    && fail "$shape changed failure was not distinguishable"
+  mv "$saved_binding" "$binding_file"
+  pass "$shape host failures coalesce across two starts and three reconciles, with recovery and changed evidence"
+}
+for host_error_shape in package conflict barrier; do
+  host_error_case "$host_error_shape" || exit 1
+done
+
+# Adapter results may contain the host evidence schema verbatim. Their success
+# status must keep identical genuine results distinct and unhandled.
+P_IDENTICAL="$PACKAGES/identical"
+make_package "$P_IDENTICAL" org.example.identical ext-identical keep-armed
+H_IDENTICAL="$HOMES/identical"; new_home "$H_IDENTICAL"
+bind_package "$H_IDENTICAL" "$P_IDENTICAL" ext-identical >/dev/null
+FM_HOME="$H_IDENTICAL" "$PROCEVENT" register-extension ext-identical identical-source --config-ref host-error-output >/dev/null
+for _ in 1 2; do
+  FM_HOME="$H_IDENTICAL" "$PROCEVENT" start identical-source > "$TMP_ROOT/identical-start.out" \
+    || fail "identical adapter result failed"
+done
+cmp "$H_IDENTICAL/state/procevent-inbox/identical-source.1.result" "$H_IDENTICAL/state/procevent-inbox/identical-source.2.result" \
+  || fail "identical adapter fixture did not emit identical host-shaped bytes"
+assert_absent "$H_IDENTICAL/state/procevent-inbox/identical-source.1.handled" "first adapter result was acknowledged"
+assert_absent "$H_IDENTICAL/state/procevent-inbox/identical-source.2.handled" "second adapter result was acknowledged"
+pass "successful identical adapter results retain distinct sequences even with host-shaped output"
+identical_installed=$(binding_value "$H_IDENTICAL" org.example.identical package_root)
+mv "$identical_installed" "$identical_installed.saved"
+for _ in 1 2; do
+  FM_HOME="$H_IDENTICAL" "$PROCEVENT" start identical-source > "$TMP_ROOT/identical-failure.out" \
+    || fail "host failure after genuine evidence failed"
+done
+cmp "$H_IDENTICAL/state/procevent-inbox/identical-source.1.result" "$H_IDENTICAL/state/procevent-inbox/identical-source.3.result" \
+  || fail "host and genuine result fixtures did not emit identical bytes"
+assert_absent "$H_IDENTICAL/state/procevent-inbox/identical-source.4.result" "repeated host failure allocated another result"
+FM_HOME="$H_IDENTICAL" "$PROCEVENT" handled identical-source 3 >/dev/null
+FM_HOME="$H_IDENTICAL" "$PROCEVENT" start identical-source > "$TMP_ROOT/identical-after-handled.out" \
+  || fail "host failure after acknowledgement failed"
+assert_present "$H_IDENTICAL/state/procevent-inbox/identical-source.4.result" "handled host evidence suppressed a fresh failure"
+assert_absent "$H_IDENTICAL/state/procevent-inbox/identical-source.4.handled" "fresh failure inherited acknowledgement"
+pass "genuine evidence cannot suppress the first host error, and handled errors do not suppress fresh failures"
 fi
 
 # --- registration, invocation, unhandled capture, and binding retirement -----

@@ -160,6 +160,7 @@ Run the focused external-binding evidence and the live Bearings session guard wi
 ```sh
 node --version
 bin/fm-test-run.sh tests/fm-extension-binding.test.sh
+bin/fm-test-run.sh tests/fm-procevent-extension-errors.test.sh
 FM_EXTENSION_BINDING_SEGMENT=lifecycle-invocation-cleanup bin/fm-test-run.sh tests/fm-extension-binding.test.sh
 bin/fm-test-run.sh tests/fm-procevent.test.sh
 FM_BEARINGS_LAVISH_LIVE=1 bin/fm-test-run.sh tests/fm-bearings-board-lavish-live-e2e.test.sh
