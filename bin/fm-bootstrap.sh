@@ -211,6 +211,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
 # shellcheck source=bin/fm-timeout-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
+# shellcheck source=bin/fm-credential-source-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-credential-source-lib.sh"
 # Shared secondmate endpoint probe + guarded relaunch; the watcher's poll tick
 # drives the same library so session start and ordinary supervision recover
 # from identical evidence through an identical path.
@@ -1148,7 +1150,7 @@ EOF
 }
 
 crew_dispatch_validate() {
-  local file err verified_harnesses typed_key typed_active=false
+  local file cred err verified_harnesses typed_key typed_active=false
   file="$CONFIG/crew-dispatch.json"
   [ -f "$file" ] || return 0
   if ! command -v jq >/dev/null 2>&1; then
@@ -1161,11 +1163,17 @@ crew_dispatch_validate() {
   fi
   typed_key=$TYPESAFE_API_KEY_PRIVATE
   [ -n "$typed_key" ] || typed_key=$(fmx_env_get TYPESAFE_API_KEY "$FM_HOME/.env")
-  [ -z "$typed_key" ] || typed_active=true
+  cred="$CONFIG/dispatch-credential-sources.json"
+  if [ -n "$typed_key" ]; then
+    typed_active=true
+  elif [ -f "$cred" ] && fm_credsrc_check "$cred" typesafe openrouter >/dev/null &&
+    fm_credsrc_declares "$cred" typesafe; then
+    typed_active=true
+  fi
   if $typed_active; then
     verified_harnesses=$(fm_control_harnesses | jq -Rsc 'split("\n") | map(select(length > 0))')
   else
-    verified_harnesses='["claude","codex","opencode","pi","pi-signed","grok","kimi","cursor","agy","muse","rovo","omp","devin","commandcode","polytoken","cortex"]'
+    verified_harnesses='["claude","codex","opencode","pi","pi-signed","grok","kimi","cursor","agy","muse","rovo","omp","devin","commandcode","polytoken","cortex","kiro"]'
   fi
   err=$(jq -r --argjson typed "$typed_active" --argjson verified_harnesses "$verified_harnesses" --arg provider_re "$FM_QUOTA_PROVIDER_ID_RE" '
     def verified($h): $verified_harnesses | index($h);
@@ -1178,6 +1186,7 @@ crew_dispatch_validate() {
       elif $h == "codex" then ((["low","medium","high","xhigh"] | index($e)) != null or ($e == "max" and $m == "gpt-5.6-luna"))
       elif $h == "grok" then (["low","medium","high"] | index($e))
       elif $h == "agy" then (["low","medium","high"] | index($e))
+      elif $h == "kiro" then (["low","medium","high","xhigh","max"] | index($e))
       elif $h == "pi" or $h == "pi-signed" or $h == "omp" then (["low","medium","high","xhigh","max"] | index($e))
       elif $h == "muse" then (["low","medium","high","xhigh","max"] | index($e))
       elif $h == "rovo" then (["low","medium","high","max"] | index($e))

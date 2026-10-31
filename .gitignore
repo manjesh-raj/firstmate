@@ -13,5 +13,6 @@ __pycache__/
 .env
 .venv/
 config/
+.claude/settings.local.json
 
 .tools/
