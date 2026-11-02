@@ -94,6 +94,7 @@ A remote route is probed read-only across its host-local boundary and is never r
 Each automatic relaunch surfaces as exactly one `check` wake plus a durable line in `state/.secondmate-relaunch-<id>`, and a mate that exceeds `FM_SECONDMATE_LIVENESS_MAX_ATTEMPTS` ledgered attempts inside `FM_SECONDMATE_LIVENESS_WINDOW_SECS` is parked behind a bound marker and escalated once until a live probe rearms it with a full attempt budget.
 `tests/fm-wake-queue.test.sh` pins the no-progress notification, drain-progress reset, declared-pause exclusion, active-turn deferral, proven-idle child-first ring, busy and unknown parent-alarm paths, genuine stall after a ring, idempotence, quiet-queue, and byte-for-byte foreign-row preservation guarantees.
 When a canonical validated task PR poll returns exactly `merged`, the watcher routes it through the shared merge-outcome emitter before retiring the poll.
+A repository template update or a control relaunch leaves an armed poll valid, and the watcher runs the current repository poll with that validated registration rather than state-file code; [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh)'s header owns the authentication mechanics.
 A legacy poll armed on a persistent `kind=secondmate` record is residue from a child's relayed PR: the watcher retires it without a merge outcome, notification marker, or wake, leaving the mate's lifecycle intact; `bin/fm-pr-check.sh` refuses new polls on such records.
 [`bin/fm-merge-outcome-lib.sh`](../bin/fm-merge-outcome-lib.sh)'s header owns role routing, PR-specific wake identity, marker-locked normal deduplication, and the at-least-once ordering that prefers a rare duplicate over silence.
 After successful outcome publication, the watcher immediately delivers the emitter's local actionable poll row and publishes a private retirement receipt bound to the poll's registration, bytes, file identities, metadata, provider, URL, and task ID.
@@ -548,7 +549,7 @@ The procedure and outcome vocabulary are owned by the [`/updatefirstmate` skill]
 
 ## Restart-proof
 
-Fleet state lives in each task's session-provider backend (tmux by hard default, herdr, rex, or cmux when selected or auto-detected, zellij/orca/paseo/t3code/tern/hc when explicitly selected), no-mistakes run records, status event logs, local markdown under `data/` including `data/captain.md`, `data/captain-shared.md`, and `data/learnings.md`, and persistent secondmate homes.
+Fleet state lives in each task's session-provider backend (see [backend selection](configuration.md#backend-selection-order)), no-mistakes run records, status event logs, local markdown under `data/` including `data/captain.md`, `data/captain-shared.md`, and `data/learnings.md`, and persistent secondmate homes.
 For herdr, respawning after a server-restored layout closes and replaces confirmed no-agent or dead task-tab husks instead of requiring manual tab cleanup.
 Secondmate recovery follows the [shared liveness contract](../bin/fm-secondmate-liveness-lib.sh) at session start and during ordinary supervision.
 Use `/stow` before an intentional reset when the conversation may hold durable knowledge that has not yet been written to disk; after that, the next firstmate session can reconcile and carry on.
