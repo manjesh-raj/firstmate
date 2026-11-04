@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--hermes-profile <name>] [--account <entry>] [--backend <name>] [--herdr-resume-lock-wait]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--hermes-profile <name>] [--account <entry>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -64,7 +64,7 @@
 #   first in the private launch-brief overlay, including the exact task-owned
 #   steering inbox. This never rewrites a project's instruction files or a
 #   secondmate's charter.
-#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
+#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>] [--account <entry>]
 #   --relaunch launches a replacement agent for an EXISTING task into that
 #   task's own recorded worktree, reusing its recorded endpoint when that
 #   endpoint still exists, instead of creating either from scratch. It is
@@ -75,13 +75,14 @@
 #   backend, kind, project or home, worktree, endpoint - comes from the task's
 #   validated state/<id>.meta, so --backend, --scout, --secondmate, a project
 #   positional, and batch pairs are all refused alongside it; only harness,
-#   model, and effort may change, which is what makes a harness switch one
-#   ordinary relaunch. It refuses unless the recorded endpoint is positively
-#   agent-free on a backend with both a recovery-grade agent-state classifier
-#   and replacement-agent support (tmux or herdr), and clears the previous
-#   harness's per-task wiring before arming the new incarnation. T3 Code has
-#   the classifier but refuses relaunch because a thread keeps its conversation
-#   across turns and provider changes. Two verdicts are agent-free: a `dead`
+#   model, effort, and a declared Claude account may change, which is what
+#   makes a harness switch one ordinary relaunch. It refuses unless the
+#   recorded endpoint is positively agent-free on a backend with both a
+#   recovery-grade agent-state classifier and replacement-agent support
+#   (tmux or herdr), and clears the previous harness's per-task wiring
+#   before arming the new incarnation. T3 Code has the classifier but refuses
+#   relaunch because a thread keeps its conversation across turns and provider
+#   changes. Two verdicts are agent-free: a `dead`
 #   endpoint is ADOPTED as-is, while an endpoint PROVEN gone is RE-CREATED in the recorded
 #   worktree and the republished record rebinds the task to it. That proof is
 #   its own step, because a backend's `missing` also covers an endpoint that is
@@ -101,6 +102,15 @@
 #   only a shell that will not go refuses.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
+#   --hermes-profile <name> selects Hermes's native -p profile for a tmux
+#   crewmate/scout; omission keeps Hermes's default selection. Names follow the
+#   native lowercase 1-64 character grammar. The resolved home is pinned for
+#   launch, and hermes_profile= is replayed on relaunch. Non-default --model is
+#   refused; effort is recorded but the profile owns model and reasoning.
+#   Native pre_llm_call/on_session_end hooks live in a private managed-scope
+#   overlay; an existing managed scope is refused. The profile's own gateway
+#   may run only while idle; a mid-turn, ambiguous or unreadable gateway is
+#   refused without changing it. No profile config or SOUL is edited.
 #   --model <name> and --effort <low|medium|high|xhigh|max|ultra> are concrete profile
 #   axes chosen by firstmate at intake. They are only threaded into harnesses whose
 #   installed CLIs were verified to support that axis; unsupported axes are omitted
@@ -497,6 +507,13 @@
 #   Pins are never inherited; remote per-mate overrides refuse locally.
 #   T3 Code refuses a pin because its provider instance owns the account.
 #   bin/fm-worker-account-lib.sh owns parsing, the check, and the shed list.
+# Claude account list (config/claude-accounts, --account <entry>):
+#   Opt-in and Claude-only. When the list is present, a Claude ship or scout
+#   spawn must name one declared entry with --account, chosen at intake, and
+#   that entry is checked, launched, and recorded exactly like a pin; a
+#   relaunch reuses the recorded entry unless --account moves it. Without the
+#   list, --account refuses and nothing else changes. docs/configuration.md
+#   "Several Claude accounts" owns the contract.
 # Per-secondmate omp profile (config/secondmate-accounts/<id>/omp-profile):
 #   Opt-in, and read only for a local secondmate's own omp agent;
 #   bin/fm-omp-profile-lib.sh owns the file and its refusals. A pinned launch
@@ -975,6 +992,8 @@ TRACEPARENT_ARG=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
+HERMES_PROFILE=
+HERMES_PROFILE_SET=0
 BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
@@ -984,6 +1003,8 @@ BASE_BRANCH_SET=0
 UPSTREAM_CONSENT=
 UPSTREAM_CONSENT_SET=0
 TRACEPARENT_SET=0
+ACCOUNT_ARG=
+ACCOUNT_SET=0
 RELAUNCH=0
 # Opt-in only: exact-resume presentation-order lock waits instead of refusing.
 # Absent/unset keeps upstream refuse-on-contention. See header.
@@ -1010,6 +1031,10 @@ for a in "$@"; do
     effort)
       EFFORT=$a
       EFFORT_SET=1
+      ;;
+    hermes-profile)
+      HERMES_PROFILE=$a
+      HERMES_PROFILE_SET=1
       ;;
     backend)
       BACKEND_ARG=$a
@@ -1038,6 +1063,10 @@ for a in "$@"; do
     traceparent)
       TRACEPARENT_ARG=$a
       TRACEPARENT_SET=1
+      ;;
+    account)
+      ACCOUNT_ARG=$a
+      ACCOUNT_SET=1
       ;;
     *)
       echo "error: internal parser state for --$want_value" >&2
@@ -1073,6 +1102,8 @@ for a in "$@"; do
     EFFORT=${a#--effort=}
     EFFORT_SET=1
     ;;
+  --hermes-profile) want_value=hermes-profile ;;
+  --hermes-profile=*) HERMES_PROFILE=${a#--hermes-profile=}; HERMES_PROFILE_SET=1 ;;
   --backend) want_value=backend ;;
   --backend=*)
     BACKEND_ARG=${a#--backend=}
@@ -1108,6 +1139,11 @@ for a in "$@"; do
     TRACEPARENT_ARG=${a#--traceparent=}
     TRACEPARENT_SET=1
     ;;
+  --account) want_value=account ;;
+  --account=*)
+    ACCOUNT_ARG=${a#--account=}
+    ACCOUNT_SET=1
+    ;;
   *) POS+=("$a") ;;
   esac
 done
@@ -1123,6 +1159,14 @@ done
   echo "error: --model requires a non-empty value" >&2
   exit 1
 }
+[ "$HERMES_PROFILE_SET" -eq 0 ] || [ -n "$HERMES_PROFILE" ] || {
+  echo "error: --hermes-profile requires a non-empty value" >&2
+  exit 1
+}
+if [ "$KIND" = secondmate ] && [ "$HERMES_PROFILE_SET" = 1 ]; then
+  echo 'error: --hermes-profile is for crewmate/scout launches, never a secondmate' >&2
+  exit 1
+fi
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || {
   echo "error: --effort requires a non-empty value" >&2
   exit 1
@@ -1145,6 +1189,16 @@ done
 }
 [ "$TRACEPARENT_SET" -eq 0 ] || [ -n "$TRACEPARENT_ARG" ] || {
   echo "error: --traceparent requires a non-empty value" >&2
+  exit 1
+}
+[ "$ACCOUNT_SET" -eq 0 ] || [ -n "$ACCOUNT_ARG" ] || {
+  echo "error: --account requires a non-empty value" >&2
+  exit 1
+}
+# A secondmate, local or remote, launches on its own per-mate pin, so --account
+# is refused here, before the remote route could ignore it.
+[ "$ACCOUNT_SET" -eq 0 ] || [ "$KIND" != secondmate ] || {
+  echo "error: --account applies to ships and scouts; secondmate ${POS[0]:-} launches on its own config/secondmate-accounts/<id>/claude-account pin" >&2
   exit 1
 }
 # A parent-delivered carrier replaces this home's own resolution, so it is
@@ -2090,6 +2144,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$HARNESS_ARG" ] || shared_args+=(--harness "$HARNESS_ARG")
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
+  [ "$HERMES_PROFILE_SET" -eq 0 ] || shared_args+=(--hermes-profile "$HERMES_PROFILE")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
   # One delivery contract applies to every pair in a batch, exactly like the shared
   # harness. Each pair still re-validates it against its own brief, so a batch
@@ -2099,6 +2154,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ "$BRANCH_PREFIX_SET" -eq 0 ] || shared_args+=(--branch-prefix "$BRANCH_PREFIX")
   [ "$BASE_BRANCH_SET" -eq 0 ] || shared_args+=(--base-branch "$BASE_BRANCH")
   [ "$HERDR_RESUME_LOCK_WAIT" -eq 0 ] || shared_args+=(--herdr-resume-lock-wait)
+  [ "$ACCOUNT_SET" -eq 0 ] || shared_args+=(--account "$ACCOUNT_ARG")
   for pair in "${POS[@]}"; do
     case "$pair" in
     *=*) : ;;
@@ -2503,6 +2559,36 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: task $ID's recorded worktree '${RELAUNCH_WT:-none}' is missing; refusing to relaunch without the local copy its work lives in" >&2
     exit 1
   }
+  if [ "$KIND" != secondmate ]; then
+    # A worker must come back in its own disposable worktree, never in a
+    # primary home or a repository's primary checkout: refuse
+    # rather than fall back to wherever the restored pane happens to sit.
+    relaunch_wt_real=$(cd "$RELAUNCH_WT" 2>/dev/null && pwd -P) || relaunch_wt_real=$RELAUNCH_WT
+    relaunch_primary=
+    for relaunch_cand in "$FM_HOME" "$FM_ROOT"; do
+      relaunch_cand_real=$(cd "$relaunch_cand" 2>/dev/null && pwd -P) || continue
+      [ "$relaunch_wt_real" = "$relaunch_cand_real" ] && relaunch_primary=$relaunch_cand
+    done
+    if [ -z "$relaunch_primary" ]; then
+      # Probe the directory's own layout: an inherited GIT_DIR naming a linked
+      # worktree with GIT_WORK_TREE naming the primary checkout would otherwise
+      # make the two answers differ and pass the primary checkout.
+      relaunch_gdc=$(
+        unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_INDEX_FILE \
+          GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CEILING_DIRECTORIES GIT_NAMESPACE \
+          GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_CONFIG GIT_CONFIG_GLOBAL \
+          GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM GIT_CONFIG_COUNT
+        git -C "$RELAUNCH_WT" rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null
+      ) || relaunch_gdc=
+      relaunch_gd=${relaunch_gdc%%$'\n'*}
+      relaunch_gc=${relaunch_gdc#*$'\n'}
+      [ -z "$relaunch_gd" ] || [ "$relaunch_gd" != "$relaunch_gc" ] || relaunch_primary="its repository's primary checkout"
+    fi
+    [ -z "$relaunch_primary" ] || {
+      echo "error: task $ID's recorded worktree '$RELAUNCH_WT' is the primary home or checkout ($relaunch_primary), not an isolated task worktree; refusing to relaunch a worker there" >&2
+      exit 1
+    }
+  fi
   if [ "$KIND" = secondmate ]; then
     FIRSTMATE_HOME=$(fm_meta_get "$RELAUNCH_META" home)
     [ -n "$FIRSTMATE_HOME" ] || FIRSTMATE_HOME=$RELAUNCH_WT
@@ -2544,7 +2630,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   }
 elif [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-  '' | claude | codex | opencode | pi | pi-signed | grok | kimi | cursor | gemini | muse | rovo | omp | agy | devin | commandcode | polytoken | cortex | kiro)
+  '' | claude | codex | opencode | pi | pi-signed | grok | kimi | cursor | gemini | muse | rovo | omp | agy | devin | commandcode | polytoken | cortex | kiro | hermes)
     ARG3=${POS[1]:-}
     ;;
   *' '*)
@@ -3019,6 +3105,8 @@ launch_template() {
   # because Cortex loads Claude-compatible hooks, and Herdr's claude integration
   # hook claims a pane as a claude session whenever that variable is set.
   cortex) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS -u FM_OMP_HARNESS -u ATLASSIAN_AGENT_TYPE -u ROVODEV_CLI __CORTEXBIN__ --dangerously-allow-all-tool-calls --plugin-dir __CORTEXPLUGIN__ __MODELFLAG____EFFORTFLAG__-- "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+  # Hermes's native interactive query starts a visible TUI, never one-shot.
+  hermes) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS -u FM_OMP_HARNESS -u ATLASSIAN_AGENT_TYPE -u ROVODEV_CLI FM_HERMES_HARNESS=hermes HERMES_HOME=__HERMESHOME__ HERMES_MANAGED_DIR=__HERMESHOOKS__ __HERMESBIN__ __HERMESPROFILE__chat --tui --yolo --accept-hooks -q "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
   # Kimi Code rejects a positional prompt, so it launches bare and receives
   # only an absolute brief pointer after the TUI readiness gate below.
   # Its turn-end signal is a globally configured Stop hook plus a guarded
@@ -3150,7 +3238,7 @@ esac
 # kiro has none either: this task verified only crewmate-side launch, busy state,
 # interrupt, exit, and resume on the V2 engine, and docs/supervision-protocols/
 # carries no kiro wake protocol (kiro-cli 2.21.4).
-if [ "$KIND" = secondmate ] && { [ "$HARNESS" = muse ] || [ "$HARNESS" = gemini ] || [ "$HARNESS" = devin ] || [ "$HARNESS" = commandcode ] || [ "$HARNESS" = polytoken ] || [ "$HARNESS" = cortex ] || [ "$HARNESS" = kiro ]; }; then
+if [ "$KIND" = secondmate ] && { [ "$HARNESS" = muse ] || [ "$HARNESS" = gemini ] || [ "$HARNESS" = devin ] || [ "$HARNESS" = commandcode ] || [ "$HARNESS" = polytoken ] || [ "$HARNESS" = cortex ] || [ "$HARNESS" = kiro ] || [ "$HARNESS" = hermes ]; }; then
   echo "error: $HARNESS is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
   exit 1
 fi
@@ -3178,6 +3266,35 @@ fi
 if [ "$HARNESS" = cortex ] && [ "$BACKEND" != tmux ] && [ "$BACKEND" != herdr ]; then
   echo "error: cortex is verified on the tmux and herdr backends only; backend=$BACKEND cannot prove its composer empty. Select backend tmux or herdr." >&2
   exit 1
+fi
+
+# Hermes is verified only as a visible tmux worker. Other backends do not
+# yet prove its profile-prefixed composer or native process identity.
+if [ "$HARNESS" = hermes ] && [ "$BACKEND" != tmux ]; then
+  echo "error: hermes is verified on the tmux backend only; backend=$BACKEND is unsupported" >&2
+  exit 1
+fi
+if [ "$HERMES_PROFILE_SET" -eq 1 ] && [ "$HARNESS" != hermes ]; then
+  echo "error: --hermes-profile requires --harness hermes" >&2
+  exit 1
+fi
+if [ "$HARNESS" = hermes ]; then
+  # shellcheck source=bin/fm-hermes-lib.sh
+  . "$SCRIPT_DIR/fm-hermes-lib.sh"
+  fm_hermes_managed_check || exit 1
+  HERMES_BIN=$(command -v hermes) || { echo 'error: hermes executable not found on PATH' >&2; exit 1; }
+  if [ "$RELAUNCH" -eq 1 ] && [ "$HERMES_PROFILE_SET" -eq 0 ] && [ "$RELAUNCH_PRIOR_HARNESS" = hermes ]; then
+    HERMES_PROFILE=$(fm_meta_get "$RELAUNCH_META" hermes_profile)
+    HERMES_HOME=$(fm_meta_get "$RELAUNCH_META" hermes_home)
+    export HERMES_HOME
+  fi
+  if [ -n "$MODEL" ] && [ "$MODEL" != default ]; then
+    echo 'error: Hermes model selection belongs to the selected profile; omit --model or use default' >&2
+    exit 1
+  fi
+  [ -z "$EFFORT" ] || echo "notice: Hermes reasoning is profile-owned; effort=$EFFORT is recorded but not passed" >&2
+  HERMES_PROFILE_HOME=$(fm_hermes_profile_home "$HERMES_BIN" "$HERMES_PROFILE") || exit 1
+  fm_hermes_gateway_check "$HERMES_PROFILE_HOME" "${HERMES_PROFILE:-${HERMES_PROFILE_HOME##*/}}" || exit 1
 fi
 
 # config/crew-exclude-tools (header above): refuse before worker provisioning
@@ -3347,7 +3464,15 @@ RAW_COMMAND=
 [ "$RAW_LAUNCH" = 0 ] || RAW_COMMAND=$ARG3
 WORKER_ACCOUNT_MATE=
 [ "$KIND" != secondmate ] || WORKER_ACCOUNT_MATE=$ID
-WORKER_ACCOUNT=$(fm_worker_account_select "$HARNESS" "$CONFIG" "$MODEL" "${PI_BIN:-$HARNESS}" "$RAW_COMMAND" "$WORKER_ACCOUNT_MATE") || exit 1
+# A declared Claude account list (config/claude-accounts) needs the entry this
+# launch spends: --account on a fresh spawn, and on a relaunch that flag or
+# else the account the task already records.
+WORKER_ACCOUNT_REQUEST=$ACCOUNT_ARG
+if [ "$RELAUNCH" -eq 1 ]; then
+  WORKER_ACCOUNT_REQUEST=$(fm_worker_account_relaunch_request "$HARNESS" "$CONFIG" "$RELAUNCH_PRIOR_HARNESS" \
+    "$(fm_meta_get "$RELAUNCH_META" account)" "$ACCOUNT_ARG" "$WORKER_ACCOUNT_MATE") || exit 1
+fi
+WORKER_ACCOUNT=$(fm_worker_account_select "$HARNESS" "$CONFIG" "$MODEL" "${PI_BIN:-$HARNESS}" "$RAW_COMMAND" "$WORKER_ACCOUNT_MATE" "$WORKER_ACCOUNT_REQUEST") || exit 1
 WORKER_ACCOUNT_DECLARED=${WORKER_ACCOUNT%%$'\t'*}
 WORKER_ACCOUNT_ROOT=${WORKER_ACCOUNT#*$'\t'}
 WORKER_ACCOUNT_PROVIDER=${WORKER_ACCOUNT_ROOT#*$'\t'}
@@ -6271,7 +6396,7 @@ BUSY_GEN=
     }
     [ "$RELAUNCH" -ne 1 ] || RELAUNCH_REPLACEMENT_BUSY_GEN=$BUSY_GEN
     ;;
-  gemini | devin | commandcode | polytoken | cortex | kiro)
+  gemini | devin | commandcode | polytoken | cortex | kiro | hermes)
     if [ "$RAW_LAUNCH" -eq 0 ]; then
       BUSY_GEN=$("$FM_ROOT/bin/fm-busy-event.sh" arm "$STATE_REAL" "$ID") || {
         echo "error: failed to arm the busy-state contract for $ID" >&2
@@ -6363,6 +6488,11 @@ BUSY_GEN=
     # .commandcode/taste/ in the project on every start (verified, 1.74.1) and
     # learns into it, so that vendor runtime state stays out of worker commits.
     exclude_path '.commandcode/taste/'
+    ;;
+  hermes)
+    if [ "$RAW_LAUNCH" -eq 0 ]; then
+      fm_hermes_write_hooks "$HERMES_BIN" "$HERMES_PROFILE_HOME" "$STATE_REAL" "$ID" "$BUSY_GEN" || exit 1
+    fi
     ;;
   cortex)
     if [ "$RAW_LAUNCH" -eq 0 ]; then
@@ -7065,7 +7195,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
+      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -7107,6 +7237,7 @@ preserve_relaunch_meta() {
   # The per-secondmate omp profile pin, only when one applies, so every other
   # task record stays byte-identical.
   [ -z "$OMP_PROFILE_PIN" ] || echo "omp_profile=$OMP_PROFILE_PIN"
+  [ "$HARNESS" != hermes ] || { echo "hermes_profile=$HERMES_PROFILE"; echo "hermes_home=$HERMES_PROFILE_HOME"; }
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
   # Default-off writes no traceparent= line.
@@ -7345,6 +7476,14 @@ commandcode)
   fi
   LAUNCH=${LAUNCH//__COMMANDCODEMOD__/$COMMANDCODEMOD}
   ;;
+hermes)
+  HERMES_PROFILE_FLAG=
+  [ -z "$HERMES_PROFILE" ] || HERMES_PROFILE_FLAG="-p $(shell_quote "$HERMES_PROFILE") "
+  LAUNCH=${LAUNCH//__HERMESBIN__/"$(shell_quote "$HERMES_BIN")"}
+  LAUNCH=${LAUNCH//__HERMESHOME__/"$(shell_quote "$HERMES_PROFILE_HOME")"}
+  LAUNCH=${LAUNCH//__HERMESPROFILE__/$HERMES_PROFILE_FLAG}
+  LAUNCH=${LAUNCH//__HERMESHOOKS__/"$(shell_quote "$STATE_REAL/$ID.hermes-hooks")"}
+  ;;
 cortex)
   LAUNCH=${LAUNCH//__CORTEXBIN__/"$(shell_quote "$CORTEX_BIN")"}
   LAUNCH=${LAUNCH//__CORTEXPLUGIN__/"$(shell_quote "$STATE_REAL/$ID.cortex-plugin")"}
@@ -7403,7 +7542,7 @@ case "$LAUNCH" in
   ;;
 esac
 case "$HARNESS" in
-claude | codex | opencode | pi | pi-signed | grok | kimi | gemini | muse | rovo | agy | devin | commandcode | cortex | kiro)
+claude | codex | opencode | pi | pi-signed | grok | kimi | gemini | muse | rovo | agy | devin | commandcode | cortex | kiro | hermes)
   LAUNCH="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI $LAUNCH"
   ;;
 esac
@@ -7787,6 +7926,37 @@ else
   if [ "$ORCA_LAUNCH_ENV_ENABLED" = 1 ]; then
     spawn_orca_wait_launch_consumed
     trap - HUP INT TERM
+  fi
+fi
+if [ "$HARNESS" = hermes ] && [ "$RAW_LAUNCH" -eq 0 ]; then
+  HERMES_READY=0
+  HERMES_DECLINED=0
+  for ((HERMES_POLL=0; HERMES_POLL<${FM_HERMES_READY_POLLS:-180}; HERMES_POLL++)); do
+    HERMES_SCREEN=$(fm_backend_capture "$BACKEND" "$T" 120 "$W" 2>/dev/null || true)
+    case "$(fm_hermes_startup_screen "$HERMES_SCREEN")" in
+      decline)
+        if [ "$HERMES_DECLINED" = 0 ]; then
+          spawn_send_key "$T" Enter || break
+          HERMES_DECLINED=1
+        fi
+        ;;
+      ready) HERMES_READY=1; break ;;
+    esac
+    case "$(fm_busy_classify "$BACKEND" "$T" hermes "$ID" "$STATE_REAL")" in
+      'busy hermes-hook'|'idle hermes-hook') HERMES_READY=1; break ;;
+    esac
+    sleep "${FM_HERMES_POLL_INTERVAL:-0.5}"
+  done
+  if [ "$HERMES_READY" != 1 ]; then
+    echo "error: Hermes did not reach its TUI or process its brief in $T; inspect profile setup, provider errors, and first-run consent (only an already-selected No thanks is answered)" >&2
+    rovo_endpoint_cleanup
+    if [ "$SPAWN_ENDPOINT_CLOSED" != 1 ]; then
+      # Hermes may still finish starting there, so the record stays for
+      # supervision and teardown instead of being rolled back.
+      SPAWN_FRESH_COMMIT_PENDING=0
+      echo "warning: could not close endpoint $T after the failed Hermes launch of $ID; its task record is kept so the worker stays reachable - inspect it, then tear it down" >&2
+    fi
+    exit 1
   fi
 fi
 if [ "$HARNESS" = kimi ]; then
